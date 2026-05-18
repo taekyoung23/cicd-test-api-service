@@ -7,7 +7,6 @@ class Settings(BaseSettings):
     api_prefix: str = "/api"
 
     aws_region: str = "ap-northeast-2"
-    aws_profile: str | None = None
 
     input_bucket: str
     result_bucket: str

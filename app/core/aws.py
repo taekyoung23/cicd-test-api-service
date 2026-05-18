@@ -4,12 +4,6 @@ from app.core.config import settings
 
 
 def get_boto3_session():
-    if settings.aws_profile:
-        return boto3.Session(
-            profile_name=settings.aws_profile,
-            region_name=settings.aws_region,
-        )
-
     return boto3.Session(region_name=settings.aws_region)
 
 

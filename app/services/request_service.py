@@ -1,63 +1,94 @@
 import uuid
+from decimal import Decimal
 
 from app.core.config import settings
 from app.db.database import get_connection
-from app.services.s3_service import (
-    build_input_key,
-    build_result_key,
-    create_upload_presigned_url,
-)
+from app.services.s3_service import build_input_key, build_result_key
 from app.services.sqs_service import send_inference_message
+from app.services.user_service import plan_from_user_type
 
 
-def create_request_id() -> str:
+def make_request_id() -> str:
     return f"req-{uuid.uuid4().hex}"
 
 
-def normalize_plan(user_type: str) -> str:
-    return "paid" if user_type == "paid" else "free"
+def to_float(value):
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
 
 
-def prepare_presigned_upload(user_id: str | None, user_type: str, filename: str) -> dict:
-    request_id = create_request_id()
+def normalize_status_for_frontend(status: str) -> str:
+    return "SUCCESS" if status == "SUCCEEDED" else status
 
-    input_key = build_input_key(user_type, request_id, filename)
-    result_key = build_result_key(user_type, request_id)
-    upload_url = create_upload_presigned_url(input_key)
+
+def build_request_context(user: dict | None) -> dict:
+    if user is None:
+        return {
+            "user_id": None,
+            "tenant_id": None,
+            "user_type": "guest",
+            "plan": "free",
+        }
+
+    user_type = user["user_type"]
+    plan = plan_from_user_type(user_type)
 
     return {
-        "request_id": request_id,
-        "upload_url": upload_url,
-        "input_bucket": settings.input_bucket,
-        "input_key": input_key,
-        "result_bucket": settings.result_bucket,
-        "result_key": result_key,
+        "user_id": user["user_id"],
+        "tenant_id": user["tenant_id"],
+        "user_type": user_type,
+        "plan": plan,
     }
+
+
+def build_storage_keys(
+    user_type: str,
+    request_id: str,
+    original_file_name: str,
+    tenant_id: str | None,
+) -> tuple[str, str]:
+    input_key = build_input_key(
+        user_type=user_type,
+        request_id=request_id,
+        filename=original_file_name,
+        tenant_id=tenant_id,
+    )
+
+    result_key = build_result_key(
+        user_type=user_type,
+        request_id=request_id,
+        tenant_id=tenant_id,
+    )
+
+    return input_key, result_key
 
 
 def insert_inference_request(row: dict) -> None:
     sql = """
     INSERT INTO inference_requests (
-        request_id,
-        user_id,
-        user_type,
-        plan,
-        input_bucket,
-        input_key,
-        result_bucket,
-        result_key,
-        status
+      request_id,
+      user_id,
+      tenant_id,
+      user_type,
+      plan,
+      input_bucket,
+      input_key,
+      result_bucket,
+      result_key,
+      status
     )
     VALUES (
-        %(request_id)s,
-        %(user_id)s,
-        %(user_type)s,
-        %(plan)s,
-        %(input_bucket)s,
-        %(input_key)s,
-        %(result_bucket)s,
-        %(result_key)s,
-        'QUEUED'
+      %(request_id)s,
+      %(user_id)s,
+      %(tenant_id)s,
+      %(user_type)s,
+      %(plan)s,
+      %(input_bucket)s,
+      %(input_key)s,
+      %(result_bucket)s,
+      %(result_key)s,
+      'QUEUED'
     )
     """
 
@@ -66,21 +97,50 @@ def insert_inference_request(row: dict) -> None:
             cur.execute(sql, row)
 
 
-def enqueue_inference_request(row: dict) -> dict:
-    row["plan"] = normalize_plan(row["user_type"])
+def create_and_enqueue_request(
+    original_file_name: str,
+    user: dict | None,
+) -> dict:
+    request_id = make_request_id()
+    ctx = build_request_context(user)
+
+    input_key, result_key = build_storage_keys(
+        user_type=ctx["user_type"],
+        request_id=request_id,
+        original_file_name=original_file_name,
+        tenant_id=ctx["tenant_id"],
+    )
+
+    row = {
+        "request_id": request_id,
+        "user_id": ctx["user_id"],
+        "tenant_id": ctx["tenant_id"],
+        "user_type": ctx["user_type"],
+        "plan": ctx["plan"],
+        "input_bucket": settings.input_bucket,
+        "input_key": input_key,
+        "result_bucket": settings.result_bucket,
+        "result_key": result_key,
+    }
 
     insert_inference_request(row)
     send_inference_message(row)
 
+    queue_type = "PAID_QUEUE" if row["plan"] == "paid" else "FREE_QUEUE"
+
     return {
-        "request_id": row["request_id"],
-        "status": "QUEUED",
-        "plan": row["plan"],
+        "request_id": request_id,
+        "queue_type": queue_type,
+        "created_at": find_inference_request(request_id)["created_at"],
     }
 
 
 def find_inference_request(request_id: str) -> dict | None:
-    sql = "SELECT * FROM inference_requests WHERE request_id = %s"
+    sql = """
+    SELECT *
+    FROM inference_requests
+    WHERE request_id = %s
+    """
 
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -88,29 +148,38 @@ def find_inference_request(request_id: str) -> dict | None:
             return cur.fetchone()
 
 
-def find_inference_requests(user_id: str | None = None, limit: int = 20) -> list[dict]:
+def find_inference_requests(user_id: str, limit: int = 20) -> list[dict]:
+    sql = """
+    SELECT *
+    FROM inference_requests
+    WHERE user_id = %s
+    ORDER BY created_at DESC
+    LIMIT %s
+    """
+
     with get_connection() as conn:
         with conn.cursor() as cur:
-            if user_id:
-                cur.execute(
-                    """
-                    SELECT *
-                    FROM inference_requests
-                    WHERE user_id = %s
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                    """,
-                    (user_id, limit),
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT *
-                    FROM inference_requests
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                    """,
-                    (limit,),
-                )
-
+            cur.execute(sql, (user_id, limit))
             return cur.fetchall()
+
+
+def build_frontend_result(row: dict) -> dict:
+    confidence = to_float(row.get("confidence"))
+    inference_time_sec = to_float(row.get("inference_time_sec"))
+
+    processing_time_ms = None
+    if inference_time_sec is not None:
+        processing_time_ms = int(inference_time_sec * 1000)
+
+    label = row.get("label")
+    result = label.upper() if label else None
+
+    return {
+        "request_id": row["request_id"],
+        "status": normalize_status_for_frontend(row["status"]),
+        "result": result,
+        "confidence": confidence,
+        "model_version": row.get("model_version") or "Nes2Net-v1",
+        "processing_time_ms": processing_time_ms,
+        "error_message": row.get("error_message"),
+    }

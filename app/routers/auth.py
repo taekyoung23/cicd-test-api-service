@@ -1,87 +1,73 @@
 from fastapi import APIRouter, HTTPException
 
-from app.core.security import create_access_token
-from app.schemas.auth_schema import LoginRequest, SignupRequest, TokenResponse
+from app.core.security import create_access_token, verify_password
+from app.schemas.auth_schema import LoginRequest, SignupRequest
+from app.services.user_service import (
+    build_guest_user,
+    build_user_response,
+    create_free_user,
+    fetch_user_by_email,
+    plan_from_user_type,
+)
 
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(prefix="/api", tags=["auth"])
 
 
-MOCK_USERS = {
-    "free@test.com": {
-        "password": "1234",
-        "user_id": "user-free-001",
-        "tenant_id": None,
-        "tier_type": "FREE",
-        "user_type": "free",
-        "plan": "free",
-        "queue_type": "FREE_QUEUE",
-    },
-    "paid@bank-a.com": {
-        "password": "1234",
-        "user_id": "user-paid-001",
-        "tenant_id": "bank-a",
-        "tier_type": "PAID",
-        "user_type": "paid",
-        "plan": "paid",
-        "queue_type": "PAID_QUEUE",
-    },
-    "admin@securevoice.com": {
-        "password": "1234",
-        "user_id": "admin-001",
-        "tenant_id": "securevoice",
-        "tier_type": "ADMIN",
-        "user_type": "admin",
-        "plan": "paid",
-        "queue_type": "ADMIN",
-    },
-}
+@router.post("/guest")
+def guest_session():
+    return build_guest_user()
 
 
-@router.post("/login")
-def login(body: LoginRequest):
-    email = body.email.lower()
-    user = MOCK_USERS.get(email)
+@router.post("/signup")
+def signup(body: SignupRequest):
+    email = body.email.lower().strip()
 
-    if not user or user["password"] != body.password:
-        raise HTTPException(status_code=401, detail="invalid email or password")
+    exists = fetch_user_by_email(email)
+    if exists:
+        raise HTTPException(status_code=409, detail="already registered email")
+
+    user = create_free_user(
+        email=email,
+        password=body.password,
+        display_name=body.display_name,
+    )
+
+    plan = plan_from_user_type(user["user_type"])
 
     token = create_access_token(
         subject=user["user_id"],
         extra_claims={
-            "email": email,
-            "tier_type": user["tier_type"],
-            "tenant_id": user["tenant_id"],
-        },
-    )
-
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "user": {
-            "email": email,
             "user_id": user["user_id"],
-            "tenant_id": user["tenant_id"],
-            "tier_type": user["tier_type"],
+            "email": user["email"],
             "user_type": user["user_type"],
-            "plan": user["plan"],
-            "queue_type": user["queue_type"],
-        },
-    }
-
-
-@router.post("/signup", response_model=TokenResponse)
-def signup(body: SignupRequest):
-    token = create_access_token(
-        subject="user-free-001",
-        extra_claims={
-            "email": body.email.lower(),
-            "tier_type": "FREE",
-            "tenant_id": None,
+            "tenant_id": user["tenant_id"],
+            "plan": plan,
         },
     )
 
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-    }
+    return build_user_response(user, access_token=token)
+
+
+@router.post("/login")
+def login(body: LoginRequest):
+    email = body.email.lower().strip()
+    user = fetch_user_by_email(email)
+
+    if not user or not verify_password(body.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="invalid email or password")
+
+    plan = plan_from_user_type(user["user_type"])
+
+    token = create_access_token(
+        subject=user["user_id"],
+        extra_claims={
+            "user_id": user["user_id"],
+            "email": user["email"],
+            "user_type": user["user_type"],
+            "tenant_id": user["tenant_id"],
+            "plan": plan,
+        },
+    )
+
+    return build_user_response(user, access_token=token)

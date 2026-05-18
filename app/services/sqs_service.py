@@ -12,11 +12,12 @@ def select_queue_url(plan: str) -> str:
 
     if not settings.free_queue_url:
         raise RuntimeError("FREE_QUEUE_URL is not configured")
+
     return settings.free_queue_url
 
 
 def send_inference_message(message: dict) -> dict:
-    queue_url = select_queue_url(message.get("plan", "free"))
+    queue_url = select_queue_url(message["plan"])
 
     return sqs_client.send_message(
         QueueUrl=queue_url,

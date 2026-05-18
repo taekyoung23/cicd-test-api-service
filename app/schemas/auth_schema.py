@@ -4,7 +4,7 @@ from pydantic import BaseModel, EmailStr
 class SignupRequest(BaseModel):
     email: EmailStr
     password: str
-    display_name: str = "무료 사용자"
+    display_name: str
 
 
 class LoginRequest(BaseModel):
@@ -18,9 +18,7 @@ class UserResponse(BaseModel):
     display_name: str
     user_type: str
     tenant_id: str | None = None
+    plan: str
     queue_type: str
-
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
+    access_token: str | None = None
+    token_type: str | None = None

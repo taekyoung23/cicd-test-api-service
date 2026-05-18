@@ -2,11 +2,32 @@ from app.core.aws import s3_client
 from app.core.config import settings
 
 
-def build_input_key(user_type: str, request_id: str, filename: str = "input.wav") -> str:
+def safe_filename(filename: str) -> str:
+    return filename.replace("/", "_").replace("\\", "_").strip() or "input.wav"
+
+
+def build_input_key(
+    user_type: str,
+    request_id: str,
+    filename: str,
+    tenant_id: str | None = None,
+) -> str:
+    filename = safe_filename(filename)
+
+    if tenant_id:
+        return f"uploads/tenants/{tenant_id}/{user_type}/{request_id}/{filename}"
+
     return f"uploads/{user_type}/{request_id}/{filename}"
 
 
-def build_result_key(user_type: str, request_id: str) -> str:
+def build_result_key(
+    user_type: str,
+    request_id: str,
+    tenant_id: str | None = None,
+) -> str:
+    if tenant_id:
+        return f"results/tenants/{tenant_id}/{user_type}/{request_id}/result.json"
+
     return f"results/{user_type}/{request_id}/result.json"
 
 

@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
-from app.routers import frontend_compat
+from app.routers import admin, auth, requests, uploads, usage
 
 
 app = FastAPI(title=settings.app_name)
@@ -17,6 +17,7 @@ app.add_middleware(
 
 
 @app.get("/health")
+@app.get("/api/health")
 def health():
     return {
         "status": "ok",
@@ -25,4 +26,8 @@ def health():
     }
 
 
-app.include_router(frontend_compat.router)
+app.include_router(auth.router)
+app.include_router(requests.router)
+app.include_router(uploads.router)
+app.include_router(usage.router)
+app.include_router(admin.router)

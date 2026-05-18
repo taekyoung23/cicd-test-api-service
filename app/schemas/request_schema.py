@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 UserType = Literal["guest", "free", "paid"]
@@ -8,10 +8,12 @@ Plan = Literal["free", "paid"]
 RequestStatus = Literal["QUEUED", "PROCESSING", "SUCCEEDED", "FAILED"]
 
 
+class AnalysisRequestCreate(BaseModel):
+    original_file_name: str
+
+
 class PresignedUrlCreate(BaseModel):
-    user_id: str | None = None
-    user_type: UserType = "guest"
-    filename: str = "input.wav"
+    original_file_name: str
 
 
 class PresignedUrlResult(BaseModel):
@@ -25,10 +27,6 @@ class PresignedUrlResult(BaseModel):
 
 class InferenceRequestCreate(BaseModel):
     request_id: str
-    user_id: str | None = None
-    user_type: UserType = "guest"
-    plan: Plan = "free"
-
     input_bucket: str
     input_key: str
     result_bucket: str
@@ -37,19 +35,23 @@ class InferenceRequestCreate(BaseModel):
 
 class InferenceRequestRow(BaseModel):
     request_id: str
-    user_id: str | None = None
+    user_id: str | None
+    tenant_id: str | None
     user_type: UserType
     plan: Plan
+
     input_bucket: str
     input_key: str
-    result_bucket: str | None = None
-    result_key: str | None = None
+    result_bucket: str | None
+    result_key: str | None
+
     status: RequestStatus
 
     label: str | None = None
     confidence: float | None = None
     fake_prob: float | None = None
     real_prob: float | None = None
+
     model_name: str | None = None
     model_version: str | None = None
     inference_time_sec: float | None = None
