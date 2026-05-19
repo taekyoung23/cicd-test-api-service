@@ -14,14 +14,18 @@ def fetch_user_by_email(email: str) -> dict | None:
       u.user_id,
       u.email,
       u.password_hash,
-      u.display_name,
-      u.user_type,
+      u.username AS display_name,
+      u.role AS user_type,
       u.tenant_id,
-      t.plan AS tenant_plan
+      u.status,
+      t.tenant_type,
+      t.tenant_name
     FROM users u
     LEFT JOIN tenants t
       ON u.tenant_id = t.tenant_id
     WHERE u.email = %s
+      AND u.status = 'ACTIVE'
+    LIMIT 1
     """
 
     with get_connection() as conn:
@@ -36,14 +40,18 @@ def fetch_user_by_id(user_id: str) -> dict | None:
       u.user_id,
       u.email,
       u.password_hash,
-      u.display_name,
-      u.user_type,
+      u.username AS display_name,
+      u.role AS user_type,
       u.tenant_id,
-      t.plan AS tenant_plan
+      u.status,
+      t.tenant_type,
+      t.tenant_name
     FROM users u
     LEFT JOIN tenants t
       ON u.tenant_id = t.tenant_id
     WHERE u.user_id = %s
+      AND u.status = 'ACTIVE'
+    LIMIT 1
     """
 
     with get_connection() as conn:
@@ -59,13 +67,14 @@ def create_free_user(email: str, password: str, display_name: str) -> dict:
     sql = """
     INSERT INTO users (
       user_id,
+      tenant_id,
       email,
       password_hash,
-      display_name,
-      user_type,
-      tenant_id
+      username,
+      role,
+      status
     )
-    VALUES (%s, %s, %s, %s, 'free', NULL)
+    VALUES (%s, NULL, %s, %s, %s, 'free', 'ACTIVE')
     """
 
     with get_connection() as conn:
@@ -79,6 +88,7 @@ def create_free_user(email: str, password: str, display_name: str) -> dict:
                     display_name,
                 ),
             )
+        conn.commit()
 
     user = fetch_user_by_id(user_id)
     if user is None:
