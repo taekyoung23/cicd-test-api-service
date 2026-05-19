@@ -1,6 +1,9 @@
 import uuid
 from decimal import Decimal
 
+import boto3
+from fastapi import UploadFile
+
 from app.core.config import settings
 from app.db.database import get_connection
 from app.services.s3_service import build_input_key, build_result_key
@@ -63,6 +66,19 @@ def build_storage_keys(
 
     return input_key, result_key
 
+def upload_input_audio(uploaded_file: UploadFile, bucket: str, key: str) -> None:
+    s3 = boto3.client("s3", region_name=settings.aws_region)
+
+    uploaded_file.file.seek(0)
+
+    s3.upload_fileobj(
+        uploaded_file.file,
+        bucket,
+        key,
+        ExtraArgs={
+            "ContentType": uploaded_file.content_type or "audio/wav"
+        },
+    )
 
 def insert_inference_request(row: dict) -> None:
     sql = """
@@ -98,6 +114,7 @@ def insert_inference_request(row: dict) -> None:
 
 
 def create_and_enqueue_request(
+    uploaded_file: UploadFile,
     original_file_name: str,
     user: dict | None,
 ) -> dict:
@@ -122,6 +139,12 @@ def create_and_enqueue_request(
         "result_bucket": settings.result_bucket,
         "result_key": result_key,
     }
+
+    upload_input_audio(
+        uploaded_file=uploaded_file,
+        bucket=settings.input_bucket,
+        key=input_key,
+    )
 
     insert_inference_request(row)
     send_inference_message(row)

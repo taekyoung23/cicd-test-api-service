@@ -1,7 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 
 from app.core.security import get_optional_claims, get_required_claims
-from app.schemas.request_schema import AnalysisRequestCreate
 from app.services.request_service import (
     build_frontend_result,
     create_and_enqueue_request,
@@ -31,13 +30,14 @@ def resolve_current_user(claims: dict | None) -> dict | None:
 
 @router.post("/analysis/request")
 def create_analysis_request(
-    body: AnalysisRequestCreate,
+    file: UploadFile = File(...),
     claims: dict | None = Depends(get_optional_claims),
 ):
     user = resolve_current_user(claims)
 
     return create_and_enqueue_request(
-        original_file_name=body.original_file_name,
+        uploaded_file=file,
+        original_file_name=file.filename,
         user=user,
     )
 
