@@ -13,6 +13,11 @@ pipeline {
         string(name: 'ECR_REPOSITORY', defaultValue: 'voice-api-service', description: 'ECR repository name for the API image')
         booleanParam(name: 'RUN_PYTEST', defaultValue: true, description: 'Run pytest when tests are present')
         booleanParam(name: 'PUSH_IMAGE', defaultValue: false, description: 'Push the image to ECR after BuildKit build')
+        booleanParam(name: 'DEPLOY_TO_ECS', defaultValue: false, description: 'Update ECS service with the newly pushed image')
+        string(name: 'ECS_CLUSTER_NAME', defaultValue: 'securevoice-dev-cluster', description: 'ECS cluster name')
+        string(name: 'ECS_SERVICE_NAME', defaultValue: 'securevoice-dev-api-service', description: 'ECS service name')
+        string(name: 'ECS_TASK_FAMILY', defaultValue: 'securevoice-dev-api', description: 'ECS task definition family')
+        string(name: 'CONTAINER_NAME', defaultValue: 'api', description: 'Container name to update in the task definition')
     }
 
     environment {
@@ -102,6 +107,156 @@ pipeline {
                 sh '''
                     set -eu
                     docker push "${IMAGE_URI}"
+                '''
+            }
+        }
+
+        stage('ECS Deploy Dry Check') {
+            when {
+                expression { return params.DEPLOY_TO_ECS }
+            }
+            steps {
+                script {
+                    if (!params.PUSH_IMAGE) {
+                        error('DEPLOY_TO_ECS=true requires PUSH_IMAGE=true so the target image exists in ECR.')
+                    }
+                    if (!params.ECS_CLUSTER_NAME?.trim() || !params.ECS_SERVICE_NAME?.trim() ||
+                        !params.ECS_TASK_FAMILY?.trim() || !params.CONTAINER_NAME?.trim()) {
+                        error('ECS_CLUSTER_NAME, ECS_SERVICE_NAME, ECS_TASK_FAMILY, and CONTAINER_NAME are required.')
+                    }
+                }
+                sh '''
+                    set -eu
+                    aws sts get-caller-identity --query Account --output text >/dev/null
+                    aws ecs describe-services \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${ECS_SERVICE_NAME}" \
+                      --query 'services[0].serviceName' \
+                      --output text
+                    aws ecs describe-task-definition \
+                      --region "${AWS_REGION}" \
+                      --task-definition "${ECS_TASK_FAMILY}" \
+                      --query 'taskDefinition.family' \
+                      --output text
+                    echo "ECS deploy dry check complete for ${ECS_SERVICE_NAME} using ${IMAGE_URI}"
+                '''
+            }
+        }
+
+        stage('ECS Task Definition Revision Register') {
+            when {
+                expression { return params.DEPLOY_TO_ECS }
+            }
+            steps {
+                script {
+                    env.NEW_TASK_DEFINITION_ARN = sh(
+                        script: '''
+                            set -eu
+                            aws ecs describe-task-definition \
+                              --region "${AWS_REGION}" \
+                              --task-definition "${ECS_TASK_FAMILY}" \
+                              --query taskDefinition \
+                              --output json > task-definition-current.json
+
+                            python3 - <<'PY'
+import json
+import os
+
+image_uri = os.environ["IMAGE_URI"]
+container_name = os.environ["CONTAINER_NAME"]
+
+with open("task-definition-current.json", "r", encoding="utf-8") as f:
+    current = json.load(f)
+
+found = False
+for container in current.get("containerDefinitions", []):
+    if container.get("name") == container_name:
+        container["image"] = image_uri
+        found = True
+        break
+
+if not found:
+    raise SystemExit(f"container not found in task definition: {container_name}")
+
+allowed = [
+    "family",
+    "taskRoleArn",
+    "executionRoleArn",
+    "networkMode",
+    "containerDefinitions",
+    "volumes",
+    "placementConstraints",
+    "requiresCompatibilities",
+    "cpu",
+    "memory",
+    "runtimePlatform",
+    "ipcMode",
+    "pidMode",
+    "proxyConfiguration",
+    "inferenceAccelerators",
+    "ephemeralStorage",
+]
+
+next_def = {
+    key: current[key]
+    for key in allowed
+    if key in current and current[key] is not None
+}
+
+with open("task-definition-new.json", "w", encoding="utf-8") as f:
+    json.dump(next_def, f, indent=2)
+PY
+
+                            aws ecs register-task-definition \
+                              --region "${AWS_REGION}" \
+                              --cli-input-json file://task-definition-new.json \
+                              --query 'taskDefinition.taskDefinitionArn' \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+                    echo "Registered new task definition revision: ${env.NEW_TASK_DEFINITION_ARN}"
+                }
+            }
+        }
+
+        stage('ECS Service Update') {
+            when {
+                expression { return params.DEPLOY_TO_ECS }
+            }
+            steps {
+                sh '''
+                    set -eu
+                    aws ecs update-service \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --service "${ECS_SERVICE_NAME}" \
+                      --task-definition "${NEW_TASK_DEFINITION_ARN}" \
+                      --no-cli-pager >/dev/null
+                    echo "ECS service update requested: ${ECS_SERVICE_NAME}"
+                '''
+            }
+        }
+
+        stage('ECS Stable Wait') {
+            when {
+                expression { return params.DEPLOY_TO_ECS }
+            }
+            steps {
+                sh '''
+                    set -eu
+                    aws ecs wait services-stable \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${ECS_SERVICE_NAME}"
+                    aws ecs describe-services \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${ECS_SERVICE_NAME}" \
+                      --query 'services[0].events[0:5].[createdAt,message]' \
+                      --output table
+                    echo "ECS service is stable: ${ECS_SERVICE_NAME}"
                 '''
             }
         }
