@@ -86,6 +86,56 @@ pipeline {
             }
         }
 
+        stage('Docker Image Smoke Test') {
+            steps {
+                sh '''
+                    set -eu
+                    CONTAINER_NAME="api-smoke-${BUILD_NUMBER}"
+
+                    docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+
+                    cleanup() {
+                      docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+                    }
+                    trap cleanup EXIT
+
+                    docker run -d \
+                      --name "${CONTAINER_NAME}" \
+                      -e APP_ENV="${APP_ENV}" \
+                      -e INPUT_BUCKET="${INPUT_BUCKET}" \
+                      -e RESULT_BUCKET="${RESULT_BUCKET}" \
+                      "${IMAGE_URI}"
+
+                    for i in $(seq 1 30); do
+                      if docker exec -i "${CONTAINER_NAME}" python - <<'PY'
+import json
+import urllib.request
+
+with urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=2) as response:
+    payload = json.loads(response.read().decode("utf-8"))
+
+if payload.get("status") != "ok":
+    raise SystemExit(f"unexpected health payload: {payload}")
+
+print(payload)
+PY
+                      then
+                        echo "API Docker image smoke test passed."
+                        exit 0
+                      fi
+
+                      echo "Waiting for API container health check... attempt=${i}"
+                      docker logs --tail=20 "${CONTAINER_NAME}" || true
+                      sleep 2
+                    done
+
+                    echo "API Docker image smoke test failed."
+                    docker logs "${CONTAINER_NAME}" || true
+                    exit 1
+                '''
+            }
+        }
+
         stage('ECR Login') {
             when {
                 expression { return params.PUSH_IMAGE }
