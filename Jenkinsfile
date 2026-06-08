@@ -7,27 +7,22 @@ pipeline {
         buildDiscarder(logRotator(numToKeepStr: '20'))
     }
 
-    parameters {
-        string(name: 'AWS_REGION', defaultValue: 'ap-northeast-2', description: 'AWS region for ECR')
-        string(name: 'AWS_ACCOUNT_ID', defaultValue: '455535733131', description: 'AWS account ID that owns the ECR repository')
-        string(name: 'ECR_REPOSITORY', defaultValue: 'voice-api-service', description: 'ECR repository name for the API image')
-        booleanParam(name: 'RUN_PYTEST', defaultValue: true, description: 'Run pytest when tests are present')
-        booleanParam(name: 'PUSH_IMAGE', defaultValue: false, description: 'Push the image to ECR after BuildKit build')
-        booleanParam(name: 'DEPLOY_TO_ECS', defaultValue: false, description: 'Update ECS service with the newly pushed image')
-        string(name: 'ECS_CLUSTER_NAME', defaultValue: 'securevoice-dev-cluster', description: 'ECS cluster name')
-        string(name: 'ECS_SERVICE_NAME', defaultValue: 'securevoice-dev-api-service', description: 'ECS service name')
-        string(name: 'ECS_TASK_FAMILY', defaultValue: 'securevoice-dev-api', description: 'ECS task definition family')
-        string(name: 'CONTAINER_NAME', defaultValue: 'api', description: 'Container name to update in the task definition')
-    }
-
     environment {
         DOCKER_BUILDKIT = '1'
         APP_ENV = 'ci'
         INPUT_BUCKET = 'ci-placeholder-input-bucket'
         RESULT_BUCKET = 'ci-placeholder-result-bucket'
+        AWS_REGION = 'ap-northeast-2'
+        AWS_ACCOUNT_ID = '455535733131'
+        ECR_REPOSITORY = 'voice-api-service'
+        ECS_CLUSTER_NAME = 'securevoice-dev-cluster'
+        ECS_SERVICE_NAME = 'securevoice-dev-api-service'
+        ECS_TASK_FAMILY = 'securevoice-dev-api'
+        CONTAINER_NAME = 'api'
     }
 
     stages {
+        // Checkout the webhook-triggering commit and derive an immutable image tag.
         stage('Source Checkout') {
             steps {
                 checkout scm
@@ -42,6 +37,7 @@ pipeline {
             }
         }
 
+        // Validate imports and run repository tests when test files are present.
         stage('Python Build & Test') {
             steps {
                 sh '''
@@ -52,26 +48,22 @@ pipeline {
                     pip install -r requirements.txt
                     python -m compileall app
                     python -c "from app.main import app"
-                    if [ "${RUN_PYTEST}" = "true" ]; then
-                      if find . -maxdepth 3 -type f \\( -name "test_*.py" -o -name "*_test.py" \\) | grep -q .; then
-                        pip install pytest
-                        pytest
-                      else
-                        echo "No pytest test files found. Skipping pytest."
-                      fi
+                    if find . -maxdepth 3 -type f \\( -name "test_*.py" -o -name "*_test.py" \\) | grep -q .; then
+                      pip install pytest
+                      pytest
+                    else
+                      echo "No pytest test files found. Skipping pytest."
                     fi
                 '''
             }
         }
 
+        // Build the API image once using the Jenkins build number and commit SHA.
         stage('BuildKit Image Build') {
             steps {
                 script {
-                    if (!params.AWS_ACCOUNT_ID?.trim()) {
-                        error('AWS_ACCOUNT_ID parameter is required to build the ECR image URI.')
-                    }
-                    env.ECR_REGISTRY = "${params.AWS_ACCOUNT_ID}.dkr.ecr.${params.AWS_REGION}.amazonaws.com"
-                    env.IMAGE_URI = "${env.ECR_REGISTRY}/${params.ECR_REPOSITORY}:${env.IMAGE_TAG}"
+                    env.ECR_REGISTRY = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+                    env.IMAGE_URI = "${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}:${env.IMAGE_TAG}"
                 }
                 sh '''
                     set -eu
@@ -86,6 +78,7 @@ pipeline {
             }
         }
 
+        // Start the built image locally and verify the API health endpoint.
         stage('Docker Image Smoke Test') {
             steps {
                 sh '''
@@ -136,10 +129,8 @@ PY
             }
         }
 
+        // Authenticate Docker to the shared ECR registry before publishing.
         stage('ECR Login') {
-            when {
-                expression { return params.PUSH_IMAGE }
-            }
             steps {
                 sh '''
                     set -eu
@@ -149,10 +140,8 @@ PY
             }
         }
 
+        // Publish the exact image that passed the smoke test.
         stage('ECR Push') {
-            when {
-                expression { return params.PUSH_IMAGE }
-            }
             steps {
                 sh '''
                     set -eu
@@ -161,20 +150,9 @@ PY
             }
         }
 
+        // Confirm the configured ECS service and task family exist before deployment.
         stage('ECS Deploy Dry Check') {
-            when {
-                expression { return params.DEPLOY_TO_ECS }
-            }
             steps {
-                script {
-                    if (!params.PUSH_IMAGE) {
-                        error('DEPLOY_TO_ECS=true requires PUSH_IMAGE=true so the target image exists in ECR.')
-                    }
-                    if (!params.ECS_CLUSTER_NAME?.trim() || !params.ECS_SERVICE_NAME?.trim() ||
-                        !params.ECS_TASK_FAMILY?.trim() || !params.CONTAINER_NAME?.trim()) {
-                        error('ECS_CLUSTER_NAME, ECS_SERVICE_NAME, ECS_TASK_FAMILY, and CONTAINER_NAME are required.')
-                    }
-                }
                 sh '''
                     set -eu
                     aws sts get-caller-identity --query Account --output text >/dev/null
@@ -194,10 +172,8 @@ PY
             }
         }
 
+        // Clone the active task definition and register a revision using the new image.
         stage('ECS Task Definition Revision Register') {
-            when {
-                expression { return params.DEPLOY_TO_ECS }
-            }
             steps {
                 script {
                     env.NEW_TASK_DEFINITION_ARN = sh(
@@ -271,10 +247,8 @@ PY
             }
         }
 
+        // Point the API ECS service at the newly registered task definition revision.
         stage('ECS Service Update') {
-            when {
-                expression { return params.DEPLOY_TO_ECS }
-            }
             steps {
                 sh '''
                     set -eu
@@ -289,10 +263,8 @@ PY
             }
         }
 
+        // Block until ECS completes the rolling deployment and reaches steady state.
         stage('ECS Stable Wait') {
-            when {
-                expression { return params.DEPLOY_TO_ECS }
-            }
             steps {
                 sh '''
                     set -eu
