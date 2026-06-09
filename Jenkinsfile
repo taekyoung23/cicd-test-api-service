@@ -2,9 +2,13 @@ pipeline {
     agent any
 
     options {
+        // 장애 분석을 위해 로그에 시간을 기록하고, 동일 Job의 배포가 동시에 실행되지 않도록 합니다.
         timestamps()
         disableConcurrentBuilds()
+        // Jenkins 저장공간이 계속 증가하지 않도록 최근 빌드 이력 20개만 보관합니다.
         buildDiscarder(logRotator(numToKeepStr: '20'))
+        // 명령 또는 AWS 배포가 장시간 멈춰 있으면 전체 Pipeline을 종료합니다.
+        timeout(time: 30, unit: 'MINUTES')
     }
 
     environment {
@@ -19,16 +23,27 @@ pipeline {
         ECS_SERVICE_NAME = 'securevoice-dev-api-service'
         ECS_TASK_FAMILY = 'securevoice-dev-api'
         CONTAINER_NAME = 'api'
+        // ECS와 ALB가 안정화된 후 실제 API 응답을 확인할 주소입니다.
+        API_HEALTH_URL = 'http://api-origin.mzmt.shop/api/health'
     }
 
     stages {
-        // Checkout the webhook-triggering commit and derive an immutable image tag.
+        // Webhook을 발생시킨 커밋을 Checkout하고 빌드마다 고유한 이미지 태그를 생성합니다.
         stage('Source Checkout') {
             steps {
                 checkout scm
                 script {
+                    // 전체 SHA는 배포 추적용으로, 짧은 SHA는 이미지 태그용으로 저장합니다.
+                    env.GIT_COMMIT_SHA = sh(
+                        script: 'git rev-parse HEAD',
+                        returnStdout: true
+                    ).trim()
                     env.GIT_SHORT_SHA = sh(
                         script: 'git rev-parse --short=7 HEAD',
+                        returnStdout: true
+                    ).trim()
+                    env.GIT_REPOSITORY_URL = sh(
+                        script: 'git config --get remote.origin.url',
                         returnStdout: true
                     ).trim()
                     env.IMAGE_TAG = "build-${env.BUILD_NUMBER}-${env.GIT_SHORT_SHA}"
@@ -37,7 +52,7 @@ pipeline {
             }
         }
 
-        // Validate imports and run repository tests when test files are present.
+        // Python 문법과 주요 모듈 Import를 검증하고, 테스트 파일이 있으면 pytest를 실행합니다.
         stage('Python Build & Test') {
             steps {
                 sh '''
@@ -58,7 +73,7 @@ pipeline {
             }
         }
 
-        // Build the API image once using the Jenkins build number and commit SHA.
+        // Jenkins 빌드 번호와 커밋 SHA를 사용하여 API 이미지를 한 번 빌드합니다.
         stage('BuildKit Image Build') {
             steps {
                 script {
@@ -78,7 +93,7 @@ pipeline {
             }
         }
 
-        // Start the built image locally and verify the API health endpoint.
+        // 빌드한 이미지를 로컬 컨테이너로 실행하고 API Health Endpoint를 확인합니다.
         stage('Docker Image Smoke Test') {
             steps {
                 sh '''
@@ -129,28 +144,52 @@ PY
             }
         }
 
-        // Authenticate Docker to the shared ECR registry before publishing.
+        // 이미지를 Push하기 전에 Docker가 ECR에 인증하도록 로그인합니다.
         stage('ECR Login') {
             steps {
-                sh '''
-                    set -eu
-                    aws ecr get-login-password --region "${AWS_REGION}" \
-                      | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
-                '''
+                // ECR Login은 ECS 배포 상태를 변경하지 않으므로 일시적 실패 시 재시도합니다.
+                retry(2) {
+                    sh '''
+                        set -eu
+                        aws ecr get-login-password --region "${AWS_REGION}" \
+                          | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+                    '''
+                }
             }
         }
 
-        // Publish the exact image that passed the smoke test.
+        // Smoke Test를 통과한 동일 이미지를 ECR에 Push합니다.
         stage('ECR Push') {
             steps {
-                sh '''
-                    set -eu
-                    docker push "${IMAGE_URI}"
-                '''
+                // 동일한 고유 빌드 태그의 Push는 일시적 네트워크 실패 후 재시도해도 안전합니다.
+                retry(2) {
+                    sh '''
+                        set -eu
+                        docker push "${IMAGE_URI}"
+                    '''
+                }
+                // Push 직후 ECR 메타데이터 조회가 잠시 지연될 수 있어 읽기 작업만 재시도합니다.
+                retry(3) {
+                    script {
+                        env.IMAGE_DIGEST = sh(
+                            script: '''
+                                set -eu
+                                aws ecr describe-images \
+                                  --region "${AWS_REGION}" \
+                                  --repository-name "${ECR_REPOSITORY}" \
+                                  --image-ids imageTag="${IMAGE_TAG}" \
+                                  --query 'imageDetails[0].imageDigest' \
+                                  --output text
+                            ''',
+                            returnStdout: true
+                        ).trim()
+                    }
+                }
+                echo "Published image digest: ${env.IMAGE_DIGEST}"
             }
         }
 
-        // Confirm the configured ECS service and task family exist before deployment.
+        // 배포 전에 설정된 ECS Service와 Task Definition Family가 존재하는지 확인합니다.
         stage('ECS Deploy Dry Check') {
             steps {
                 sh '''
@@ -172,10 +211,11 @@ PY
             }
         }
 
-        // Clone the active task definition and register a revision using the new image.
+        // 현재 Task Definition을 복제하고 새 이미지가 반영된 Revision을 등록합니다.
         stage('ECS Task Definition Revision Register') {
             steps {
                 script {
+                    // 중복 Revision 생성을 방지하기 위해 상태 변경 명령은 의도적으로 재시도하지 않습니다.
                     env.NEW_TASK_DEFINITION_ARN = sh(
                         script: '''
                             set -eu
@@ -247,9 +287,10 @@ PY
             }
         }
 
-        // Point the API ECS service at the newly registered task definition revision.
+        // API ECS Service가 새로 등록한 Task Definition Revision을 사용하도록 변경합니다.
         stage('ECS Service Update') {
             steps {
+                // 배포 이력이 불명확해지는 것을 방지하기 위해 Service Update는 한 번만 실행합니다.
                 sh '''
                     set -eu
                     aws ecs update-service \
@@ -263,8 +304,12 @@ PY
             }
         }
 
-        // Block until ECS completes the rolling deployment and reaches steady state.
+        // ECS Rolling Update가 완료되고 Service가 안정 상태가 될 때까지 기다립니다.
         stage('ECS Stable Wait') {
+            options {
+                // Rolling Update 시간은 허용하되 무기한 대기하지 않도록 제한합니다.
+                timeout(time: 15, unit: 'MINUTES')
+            }
             steps {
                 sh '''
                     set -eu
@@ -282,6 +327,105 @@ PY
                 '''
             }
         }
+
+        // 새 Revision 실행 여부, ALB Target 상태, 실제 API 응답을 검증합니다.
+        stage('Post-Deploy Verification') {
+            options {
+                // ECS 안정화 이후의 검증은 짧은 시간 안에 완료되어야 합니다.
+                timeout(time: 5, unit: 'MINUTES')
+            }
+            steps {
+                sh '''
+                    set -eu
+
+                    RUNNING_TASK_ARNS="$(aws ecs list-tasks \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --service-name "${ECS_SERVICE_NAME}" \
+                      --desired-status RUNNING \
+                      --query 'taskArns' \
+                      --output text)"
+
+                    if [ -z "${RUNNING_TASK_ARNS}" ] || [ "${RUNNING_TASK_ARNS}" = "None" ]; then
+                      echo "No RUNNING API tasks found."
+                      exit 1
+                    fi
+
+                    UNEXPECTED_TASKS="$(aws ecs describe-tasks \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --tasks ${RUNNING_TASK_ARNS} \
+                      --query "tasks[?taskDefinitionArn!='${NEW_TASK_DEFINITION_ARN}'].taskArn" \
+                      --output text)"
+
+                    if [ -n "${UNEXPECTED_TASKS}" ] && [ "${UNEXPECTED_TASKS}" != "None" ]; then
+                      echo "RUNNING tasks still use an unexpected task definition: ${UNEXPECTED_TASKS}"
+                      exit 1
+                    fi
+
+                    TARGET_GROUP_ARN="$(aws ecs describe-services \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${ECS_SERVICE_NAME}" \
+                      --query 'services[0].loadBalancers[0].targetGroupArn' \
+                      --output text)"
+
+                    TARGET_HEALTH_STATES="$(aws elbv2 describe-target-health \
+                      --region "${AWS_REGION}" \
+                      --target-group-arn "${TARGET_GROUP_ARN}" \
+                      --query 'TargetHealthDescriptions[].TargetHealth.State' \
+                      --output text)"
+
+                    DESIRED_COUNT="$(aws ecs describe-services \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${ECS_SERVICE_NAME}" \
+                      --query 'services[0].desiredCount' \
+                      --output text)"
+
+                    HEALTHY_TARGET_COUNT="$(printf '%s\n' ${TARGET_HEALTH_STATES} \
+                      | awk '$1 == "healthy" { count++ } END { print count + 0 }')"
+
+                    # Rolling Update 직후에는 이전 Target이 잠시 draining 상태로 남을 수 있습니다.
+                    # 모든 Target이 healthy인지 확인하지 않고 desiredCount 이상 healthy인지 확인합니다.
+                    if [ "${HEALTHY_TARGET_COUNT}" -lt "${DESIRED_COUNT}" ]; then
+                      echo "Healthy API targets (${HEALTHY_TARGET_COUNT}) are fewer than desired tasks (${DESIRED_COUNT})."
+                      exit 1
+                    fi
+
+                    python3 - <<'PY'
+import json
+import os
+import urllib.request
+
+url = os.environ["API_HEALTH_URL"]
+with urllib.request.urlopen(url, timeout=10) as response:
+    payload = json.loads(response.read().decode("utf-8"))
+    if response.status != 200:
+        raise SystemExit(f"unexpected API health status: {response.status}")
+    if payload.get("status") != "ok":
+        raise SystemExit(f"unexpected API health payload: {payload}")
+
+print(f"API post-deploy health check passed: {url} payload={payload}")
+PY
+
+                    echo "API post-deploy verification passed for ${NEW_TASK_DEFINITION_ARN}"
+                '''
+            }
+        }
+
+        // 감사와 장애 분석에 필요한 변경 불가능한 배포 식별 정보를 출력합니다.
+        stage('Deployment Summary') {
+            steps {
+                echo "Repository: ${env.GIT_REPOSITORY_URL}"
+                echo "Git commit: ${env.GIT_COMMIT_SHA}"
+                echo "Jenkins build: ${env.BUILD_URL}"
+                echo "Image URI: ${env.IMAGE_URI}"
+                echo "Image digest: ${env.IMAGE_DIGEST}"
+                echo "ECS service: ${env.ECS_SERVICE_NAME}"
+                echo "Task definition: ${env.NEW_TASK_DEFINITION_ARN}"
+            }
+        }
     }
 
     post {
@@ -289,12 +433,18 @@ PY
             echo "API image build completed: ${env.IMAGE_URI}"
         }
         failure {
-            echo 'API build pipeline failed. Check Jenkins console output for the failing stage.'
+            echo "API pipeline failed. Build: ${env.BUILD_URL}, commit: ${env.GIT_COMMIT_SHA}, image: ${env.IMAGE_URI}"
         }
         always {
+            // 현재 빌드가 생성한 파일과 이미지만 선택적으로 정리합니다.
+            // 다른 Jenkins Job이 같은 Host를 사용할 수 있으므로 전체 Docker prune은 실행하지 않습니다.
             sh '''
                 set +e
-                rm -rf .venv
+                rm -rf .venv task-definition-current.json task-definition-new.json
+                docker rm -f "api-smoke-${BUILD_NUMBER}" >/dev/null 2>&1 || true
+                if [ -n "${IMAGE_URI:-}" ]; then
+                  docker image rm "${IMAGE_URI}" >/dev/null 2>&1 || true
+                fi
             '''
         }
     }
