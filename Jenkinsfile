@@ -293,6 +293,18 @@ PY
                 // 배포 이력이 불명확해지는 것을 방지하기 위해 Service Update는 한 번만 실행합니다.
                 sh '''
                     set -eu
+                    CIRCUIT_BREAKER="$(aws ecs describe-services \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${ECS_SERVICE_NAME}" \
+                      --query 'services[0].deploymentConfiguration.deploymentCircuitBreaker.[enable,rollback]' \
+                      --output text)"
+
+                    if ! printf '%s\n' "${CIRCUIT_BREAKER}" | awk '$1 == "True" && $2 == "True" { enabled = 1 } END { exit !enabled }'; then
+                      echo "ECS deployment circuit breaker with rollback must be enabled before deployment: ${CIRCUIT_BREAKER}"
+                      exit 1
+                    fi
+
                     aws ecs update-service \
                       --region "${AWS_REGION}" \
                       --cluster "${ECS_CLUSTER_NAME}" \
@@ -313,16 +325,48 @@ PY
             steps {
                 sh '''
                     set -eu
+                    WAIT_EXIT=0
+                    set +e
                     aws ecs wait services-stable \
                       --region "${AWS_REGION}" \
                       --cluster "${ECS_CLUSTER_NAME}" \
-                      --services "${ECS_SERVICE_NAME}"
+                      --services "${ECS_SERVICE_NAME}" || WAIT_EXIT=$?
+                    set -e
+
                     aws ecs describe-services \
                       --region "${AWS_REGION}" \
                       --cluster "${ECS_CLUSTER_NAME}" \
                       --services "${ECS_SERVICE_NAME}" \
-                      --query 'services[0].events[0:5].[createdAt,message]' \
+                      --query 'services[0].deployments[].{Status:status,RolloutState:rolloutState,TaskDefinition:taskDefinition,Desired:desiredCount,Running:runningCount,Failed:failedTasks}' \
                       --output table
+
+                    aws ecs describe-services \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${ECS_SERVICE_NAME}" \
+                      --query 'services[0].events[0:10].[createdAt,message]' \
+                      --output table
+
+                    FINAL_TASK_DEFINITION_ARN="$(aws ecs describe-services \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${ECS_SERVICE_NAME}" \
+                      --query 'services[0].taskDefinition' \
+                      --output text)"
+
+                    echo "Requested task definition: ${NEW_TASK_DEFINITION_ARN}"
+                    echo "Final service task definition: ${FINAL_TASK_DEFINITION_ARN}"
+
+                    if [ "${WAIT_EXIT}" -ne 0 ]; then
+                      echo "ECS service did not reach stable state. Check deployment state and recent events above."
+                      exit "${WAIT_EXIT}"
+                    fi
+
+                    if [ "${FINAL_TASK_DEFINITION_ARN}" != "${NEW_TASK_DEFINITION_ARN}" ]; then
+                      echo "Requested API revision is not active. ECS Circuit Breaker rollback or another service update occurred."
+                      exit 1
+                    fi
+
                     echo "ECS service is stable: ${ECS_SERVICE_NAME}"
                 '''
             }
@@ -337,6 +381,20 @@ PY
             steps {
                 sh '''
                     set -eu
+
+                    FINAL_TASK_DEFINITION_ARN="$(aws ecs describe-services \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${ECS_SERVICE_NAME}" \
+                      --query 'services[0].taskDefinition' \
+                      --output text)"
+
+                    if [ "${FINAL_TASK_DEFINITION_ARN}" != "${NEW_TASK_DEFINITION_ARN}" ]; then
+                      echo "API service revision changed before post-deploy verification completed."
+                      echo "Requested task definition: ${NEW_TASK_DEFINITION_ARN}"
+                      echo "Final service task definition: ${FINAL_TASK_DEFINITION_ARN}"
+                      exit 1
+                    fi
 
                     RUNNING_TASK_ARNS="$(aws ecs list-tasks \
                       --region "${AWS_REGION}" \
