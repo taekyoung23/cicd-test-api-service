@@ -467,7 +467,7 @@ PY
                       exit 1
                     fi
 
-                    if [ "${ROLLBACK_TEST_MODE}" = "API_VERIFY_FAIL" ]; then
+                    if [ "${ROLLBACK_TEST_MODE:-NONE}" = "API_VERIFY_FAIL" ]; then
                       echo "Intentional API verification failure for rollback test."
                       exit 1
                     fi
