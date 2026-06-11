@@ -11,6 +11,14 @@ pipeline {
         timeout(time: 30, unit: 'MINUTES')
     }
 
+    parameters {
+        choice(
+            name: 'ROLLBACK_TEST_MODE',
+            choices: ['NONE', 'API_VERIFY_FAIL'],
+            description: 'API automatic rollback verification only'
+        )
+    }
+
     environment {
         DOCKER_BUILDKIT = '1'
         APP_ENV = 'ci'
@@ -33,6 +41,8 @@ pipeline {
             steps {
                 checkout scm
                 script {
+                    env.SERVICE_UPDATE_REQUESTED = 'false'
+                    env.DEPLOY_PHASE = 'PRE_DEPLOY'
                     // 전체 SHA는 배포 추적용으로, 짧은 SHA는 이미지 태그용으로 저장합니다.
                     env.GIT_COMMIT_SHA = sh(
                         script: 'git rev-parse HEAD',
@@ -215,6 +225,54 @@ PY
         stage('ECS Task Definition Revision Register') {
             steps {
                 script {
+                    env.PREVIOUS_TASK_DEFINITION_ARN = sh(
+                        script: '''
+                            set -eu
+                            aws ecs describe-services \
+                              --region "${AWS_REGION}" \
+                              --cluster "${ECS_CLUSTER_NAME}" \
+                              --services "${ECS_SERVICE_NAME}" \
+                              --query 'services[0].taskDefinition' \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+                    if (!env.PREVIOUS_TASK_DEFINITION_ARN || env.PREVIOUS_TASK_DEFINITION_ARN == 'None') {
+                        error('Unable to capture the API rollback baseline task definition.')
+                    }
+                    env.PREVIOUS_IMAGE_URI = sh(
+                        script: '''
+                            set -eu
+                            aws ecs describe-task-definition \
+                              --region "${AWS_REGION}" \
+                              --task-definition "${PREVIOUS_TASK_DEFINITION_ARN}" \
+                              --query "taskDefinition.containerDefinitions[?name=='${CONTAINER_NAME}'].image | [0]" \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+                    env.PREVIOUS_DESIRED_COUNT = sh(
+                        script: '''
+                            set -eu
+                            aws ecs describe-services \
+                              --region "${AWS_REGION}" \
+                              --cluster "${ECS_CLUSTER_NAME}" \
+                              --services "${ECS_SERVICE_NAME}" \
+                              --query 'services[0].desiredCount' \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+                    if (!env.PREVIOUS_IMAGE_URI || env.PREVIOUS_IMAGE_URI == 'None') {
+                        error('Unable to capture the API rollback baseline image URI.')
+                    }
+                    if (!env.PREVIOUS_DESIRED_COUNT || env.PREVIOUS_DESIRED_COUNT == 'None') {
+                        error('Unable to capture the API rollback baseline desired count.')
+                    }
+                    echo "Captured API rollback baseline: ${env.PREVIOUS_TASK_DEFINITION_ARN}"
+                    echo "Previous API image: ${env.PREVIOUS_IMAGE_URI}"
+                    echo "Previous API desired count: ${env.PREVIOUS_DESIRED_COUNT}"
+
                     // 중복 Revision 생성을 방지하기 위해 상태 변경 명령은 의도적으로 재시도하지 않습니다.
                     env.NEW_TASK_DEFINITION_ARN = sh(
                         script: '''
@@ -290,29 +348,36 @@ PY
         // API ECS Service가 새로 등록한 Task Definition Revision을 사용하도록 변경합니다.
         stage('ECS Service Update') {
             steps {
-                // 배포 이력이 불명확해지는 것을 방지하기 위해 Service Update는 한 번만 실행합니다.
-                sh '''
-                    set -eu
-                    CIRCUIT_BREAKER="$(aws ecs describe-services \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --services "${ECS_SERVICE_NAME}" \
-                      --query 'services[0].deploymentConfiguration.deploymentCircuitBreaker.[enable,rollback]' \
-                      --output text)"
+                script {
+                    env.DEPLOY_PHASE = 'ECS_SERVICE_UPDATE'
+                    // 배포 이력이 불명확해지는 것을 방지하기 위해 Service Update는 한 번만 실행합니다.
+                    sh '''
+                        set -eu
+                        CIRCUIT_BREAKER="$(aws ecs describe-services \
+                          --region "${AWS_REGION}" \
+                          --cluster "${ECS_CLUSTER_NAME}" \
+                          --services "${ECS_SERVICE_NAME}" \
+                          --query 'services[0].deploymentConfiguration.deploymentCircuitBreaker.[enable,rollback]' \
+                          --output text)"
 
-                    if ! printf '%s\n' "${CIRCUIT_BREAKER}" | awk '$1 == "True" && $2 == "True" { enabled = 1 } END { exit !enabled }'; then
-                      echo "ECS deployment circuit breaker with rollback must be enabled before deployment: ${CIRCUIT_BREAKER}"
-                      exit 1
-                    fi
+                        if ! printf '%s\n' "${CIRCUIT_BREAKER}" | awk '$1 == "True" && $2 == "True" { enabled = 1 } END { exit !enabled }'; then
+                          echo "ECS deployment circuit breaker with rollback must be enabled before deployment: ${CIRCUIT_BREAKER}"
+                          exit 1
+                        fi
+                    '''
 
-                    aws ecs update-service \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --service "${ECS_SERVICE_NAME}" \
-                      --task-definition "${NEW_TASK_DEFINITION_ARN}" \
-                      --no-cli-pager >/dev/null
-                    echo "ECS service update requested: ${ECS_SERVICE_NAME}"
-                '''
+                    env.SERVICE_UPDATE_REQUESTED = 'true'
+                    sh '''
+                        set -eu
+                        aws ecs update-service \
+                          --region "${AWS_REGION}" \
+                          --cluster "${ECS_CLUSTER_NAME}" \
+                          --service "${ECS_SERVICE_NAME}" \
+                          --task-definition "${NEW_TASK_DEFINITION_ARN}" \
+                          --no-cli-pager >/dev/null
+                        echo "ECS service update requested: ${ECS_SERVICE_NAME}"
+                    '''
+                }
             }
         }
 
@@ -323,6 +388,9 @@ PY
                 timeout(time: 15, unit: 'MINUTES')
             }
             steps {
+                script {
+                    env.DEPLOY_PHASE = 'SERVICE_STABILIZATION_FAILED'
+                }
                 sh '''
                     set -eu
                     WAIT_EXIT=0
@@ -379,6 +447,9 @@ PY
                 timeout(time: 5, unit: 'MINUTES')
             }
             steps {
+                script {
+                    env.DEPLOY_PHASE = 'POST_DEPLOY_VERIFICATION_FAILED'
+                }
                 sh '''
                     set -eu
 
@@ -393,6 +464,11 @@ PY
                       echo "API service revision changed before post-deploy verification completed."
                       echo "Requested task definition: ${NEW_TASK_DEFINITION_ARN}"
                       echo "Final service task definition: ${FINAL_TASK_DEFINITION_ARN}"
+                      exit 1
+                    fi
+
+                    if [ "${ROLLBACK_TEST_MODE}" = "API_VERIFY_FAIL" ]; then
+                      echo "Intentional API verification failure for rollback test."
                       exit 1
                     fi
 
@@ -469,6 +545,9 @@ PY
 
                     echo "API post-deploy verification passed for ${NEW_TASK_DEFINITION_ARN}"
                 '''
+                script {
+                    env.DEPLOY_PHASE = 'DEPLOY_SUCCESS'
+                }
             }
         }
 
@@ -481,7 +560,11 @@ PY
                 echo "Image URI: ${env.IMAGE_URI}"
                 echo "Image digest: ${env.IMAGE_DIGEST}"
                 echo "ECS service: ${env.ECS_SERVICE_NAME}"
-                echo "Task definition: ${env.NEW_TASK_DEFINITION_ARN}"
+                echo "Previous task definition: ${env.PREVIOUS_TASK_DEFINITION_ARN}"
+                echo "Previous image: ${env.PREVIOUS_IMAGE_URI}"
+                echo "Previous desired count: ${env.PREVIOUS_DESIRED_COUNT}"
+                echo "New task definition: ${env.NEW_TASK_DEFINITION_ARN}"
+                echo "New image: ${env.IMAGE_URI}"
             }
         }
     }
@@ -489,9 +572,159 @@ PY
     post {
         success {
             echo "API image build completed: ${env.IMAGE_URI}"
+            echo "Deployment result: DEPLOY_SUCCESS"
         }
-        failure {
-            echo "API pipeline failed. Build: ${env.BUILD_URL}, commit: ${env.GIT_COMMIT_SHA}, image: ${env.IMAGE_URI}"
+        unsuccessful {
+            echo "API pipeline did not complete successfully. Build: ${env.BUILD_URL}, commit: ${env.GIT_COMMIT_SHA}, image: ${env.IMAGE_URI}"
+            script {
+                if (env.DEPLOY_PHASE == 'DEPLOY_SUCCESS') {
+                    echo "Rollback skipped: API deployment verification already succeeded."
+                } else if (env.SERVICE_UPDATE_REQUESTED != 'true') {
+                    echo "Rollback skipped: API service was not updated by this build."
+                } else {
+                    int rollbackStatus = sh(
+                        returnStatus: true,
+                        script: '''
+                            set -u
+
+                            print_diagnostics() {
+                              aws ecs describe-services \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --services "${ECS_SERVICE_NAME}" \
+                                --query 'services[0].deployments[].{Status:status,RolloutState:rolloutState,Reason:rolloutStateReason,TaskDefinition:taskDefinition,Desired:desiredCount,Running:runningCount,Failed:failedTasks}' \
+                                --output table || true
+                              aws ecs describe-services \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --services "${ECS_SERVICE_NAME}" \
+                                --query 'services[0].events[0:10].[createdAt,message]' \
+                                --output table || true
+                            }
+
+                            verify_api_health() {
+                              TARGET_GROUP_ARN="$(aws ecs describe-services \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --services "${ECS_SERVICE_NAME}" \
+                                --query 'services[0].loadBalancers[0].targetGroupArn' \
+                                --output text)" || return 1
+                              DESIRED_COUNT="$(aws ecs describe-services \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --services "${ECS_SERVICE_NAME}" \
+                                --query 'services[0].desiredCount' \
+                                --output text)" || return 1
+                              RUNNING_COUNT="$(aws ecs describe-services \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --services "${ECS_SERVICE_NAME}" \
+                                --query 'services[0].runningCount' \
+                                --output text)" || return 1
+                              case "${DESIRED_COUNT}:${RUNNING_COUNT}" in
+                                *[!0-9:]*)
+                                  echo "Rollback verification failed: Invalid Desired/Running Count values: desired=${DESIRED_COUNT}, running=${RUNNING_COUNT}"
+                                  return 1
+                                  ;;
+                              esac
+                              if [ "${RUNNING_COUNT}" -ne "${DESIRED_COUNT}" ]; then
+                                echo "Rollback verification failed: Running Count (${RUNNING_COUNT}) does not match Desired Count (${DESIRED_COUNT})."
+                                return 1
+                              fi
+
+                              for attempt in 1 2 3 4 5; do
+                                HEALTHY_TARGET_COUNT="$(aws elbv2 describe-target-health \
+                                  --region "${AWS_REGION}" \
+                                  --target-group-arn "${TARGET_GROUP_ARN}" \
+                                  --query 'length(TargetHealthDescriptions[?TargetHealth.State==`healthy`])' \
+                                  --output text 2>/dev/null || printf '0')"
+                                if [ "${HEALTHY_TARGET_COUNT}" -ge "${DESIRED_COUNT}" ] && \
+                                   python3 -c 'import json, os, urllib.request; r=urllib.request.urlopen(os.environ["API_HEALTH_URL"], timeout=10); p=json.loads(r.read().decode("utf-8")); raise SystemExit(0 if r.status == 200 and p.get("status") == "ok" else 1)' 2>/dev/null; then
+                                  return 0
+                                fi
+                                echo "Waiting for rolled back API health... attempt=${attempt}"
+                                sleep 10
+                              done
+                              return 1
+                            }
+
+                            echo "Rollback trigger: ${DEPLOY_PHASE}"
+                            echo "Previous revision: ${PREVIOUS_TASK_DEFINITION_ARN}"
+                            echo "Previous image: ${PREVIOUS_IMAGE_URI}"
+                            echo "Previous desired count: ${PREVIOUS_DESIRED_COUNT}"
+                            echo "Requested revision: ${NEW_TASK_DEFINITION_ARN}"
+                            echo "Requested image: ${IMAGE_URI}"
+
+                            CURRENT_TASK_DEFINITION_ARN="$(aws ecs describe-services \
+                              --region "${AWS_REGION}" \
+                              --cluster "${ECS_CLUSTER_NAME}" \
+                              --services "${ECS_SERVICE_NAME}" \
+                              --query 'services[0].taskDefinition' \
+                              --output text)" || {
+                                echo "Rollback result: ROLLBACK_FAILED (unable to read current revision)"
+                                exit 1
+                              }
+
+                            echo "Current revision before rollback: ${CURRENT_TASK_DEFINITION_ARN}"
+                            if [ "${CURRENT_TASK_DEFINITION_ARN}" = "${PREVIOUS_TASK_DEFINITION_ARN}" ]; then
+                              echo "Rollback action: PREVIOUS_REVISION_ALREADY_ACTIVE"
+                              ROLLBACK_RESULT="PREVIOUS_REVISION_RECOVERY_VERIFIED"
+                            elif [ "${CURRENT_TASK_DEFINITION_ARN}" = "${NEW_TASK_DEFINITION_ARN}" ]; then
+                              echo "Rollback action: JENKINS_EXPLICIT_ROLLBACK"
+                              ROLLBACK_RESULT="JENKINS_ROLLBACK_SUCCESS"
+                              aws ecs update-service \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --service "${ECS_SERVICE_NAME}" \
+                                --task-definition "${PREVIOUS_TASK_DEFINITION_ARN}" \
+                                --no-cli-pager >/dev/null || {
+                                  echo "Rollback result: ROLLBACK_FAILED (update-service failed)"
+                                  print_diagnostics
+                                  exit 1
+                                }
+                            else
+                              echo "Rollback result: EXTERNAL_UPDATE_DETECTED"
+                              echo "Automatic rollback stopped to avoid overwriting another deployment."
+                              print_diagnostics
+                              exit 2
+                            fi
+
+                            aws ecs wait services-stable \
+                              --region "${AWS_REGION}" \
+                              --cluster "${ECS_CLUSTER_NAME}" \
+                              --services "${ECS_SERVICE_NAME}" || {
+                                echo "Rollback result: ROLLBACK_FAILED (service did not stabilize)"
+                                print_diagnostics
+                                exit 1
+                              }
+
+                            FINAL_TASK_DEFINITION_ARN="$(aws ecs describe-services \
+                              --region "${AWS_REGION}" \
+                              --cluster "${ECS_CLUSTER_NAME}" \
+                              --services "${ECS_SERVICE_NAME}" \
+                              --query 'services[0].taskDefinition' \
+                              --output text)"
+                            if [ "${FINAL_TASK_DEFINITION_ARN}" != "${PREVIOUS_TASK_DEFINITION_ARN}" ]; then
+                              echo "Rollback result: ROLLBACK_FAILED (unexpected final revision: ${FINAL_TASK_DEFINITION_ARN})"
+                              print_diagnostics
+                              exit 1
+                            fi
+
+                            if ! verify_api_health; then
+                              echo "Rollback result: ROLLBACK_FAILED (rolled back API health verification failed)"
+                              print_diagnostics
+                              exit 1
+                            fi
+
+                            echo "Rollback result: ${ROLLBACK_RESULT}"
+                            echo "Final revision: ${FINAL_TASK_DEFINITION_ARN}"
+                        '''
+                    )
+                    if (rollbackStatus != 0) {
+                        echo "API rollback handling did not complete successfully. Exit code: ${rollbackStatus}"
+                    }
+                }
+            }
         }
         always {
             // 현재 빌드가 생성한 파일과 이미지만 선택적으로 정리합니다.
