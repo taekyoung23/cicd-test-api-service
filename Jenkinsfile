@@ -1,3 +1,76 @@
+def slackDisplay(value) {
+    return value == null || value.toString().trim() == '' ? 'N/A' : value.toString()
+}
+
+def sendSlackNotification(String title, Map details) {
+    String messageFile = ".slack-message-${env.BUILD_NUMBER ?: 'unknown'}.txt"
+    String payloadFile = ".slack-payload-${env.BUILD_NUMBER ?: 'unknown'}.json"
+    try {
+        String body = ([title] + details.collect { key, value ->
+            "*${key}:* ${slackDisplay(value)}"
+        }).join('\n')
+        writeFile(file: messageFile, text: body)
+        withCredentials([
+            string(credentialsId: 'slack-webhook-url', variable: 'SLACK_WEBHOOK_URL')
+        ]) {
+            int slackStatus = sh(
+                returnStatus: true,
+                script: """
+                    set +x
+                    set -e
+                    python3 - '${messageFile}' '${payloadFile}' <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as message_file:
+    message = message_file.read()
+
+with open(sys.argv[2], "w", encoding="utf-8") as payload_file:
+    json.dump({"text": message}, payload_file)
+PY
+                    curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
+                      --header 'Content-Type: application/json' \
+                      --data-binary @'${payloadFile}' \
+                      "\${SLACK_WEBHOOK_URL}" >/dev/null
+                """
+            )
+            if (slackStatus == 0) {
+                echo 'Slack notification sent'
+            } else {
+                echo "Slack notification failed but ignored. Exit code: ${slackStatus}"
+            }
+        }
+    } catch (Exception ignored) {
+        echo 'Slack notification failed but ignored'
+    } finally {
+        try {
+            sh(returnStatus: true, script: "rm -f '${messageFile}' '${payloadFile}'")
+        } catch (Exception ignored) {
+            echo 'Slack notification payload cleanup failed but ignored'
+        }
+    }
+}
+
+def readEcsServiceRevisionSafely(String serviceName) {
+    try {
+        return sh(
+            script: """
+                set -eu
+                aws ecs describe-services \
+                  --region '${env.AWS_REGION}' \
+                  --cluster '${env.ECS_CLUSTER_NAME}' \
+                  --services '${serviceName}' \
+                  --query 'services[0].taskDefinition' \
+                  --output text
+            """,
+            returnStdout: true
+        ).trim()
+    } catch (Exception ignored) {
+        echo 'Unable to read final ECS revision for Slack notification; ignored.'
+        return 'UNKNOWN'
+    }
+}
+
 pipeline {
     agent any
 
@@ -74,8 +147,8 @@ pipeline {
                     python -m compileall app
                     python -c "from app.main import app"
                     if find . -maxdepth 3 -type f \\( -name "test_*.py" -o -name "*_test.py" \\) | grep -q .; then
-                      pip install pytest
-                      pytest
+                      python -m pip install -r requirements-test.txt
+                      python -m pytest
                     else
                       echo "No pytest test files found. Skipping pytest."
                     fi
@@ -573,10 +646,37 @@ PY
         success {
             echo "API image build completed: ${env.IMAGE_URI}"
             echo "Deployment result: DEPLOY_SUCCESS"
+            script {
+                sendSlackNotification(':white_check_mark: API deployment succeeded', [
+                    Result                 : 'SUCCESS',
+                    Job                    : env.JOB_NAME,
+                    Build                  : env.BUILD_NUMBER,
+                    Commit                 : env.GIT_COMMIT_SHA ?: env.GIT_SHORT_SHA,
+                    'Image URI'            : env.IMAGE_URI,
+                    'Image Digest'         : env.IMAGE_DIGEST,
+                    'ECS Service'          : env.ECS_SERVICE_NAME,
+                    'New Task Definition'  : env.NEW_TASK_DEFINITION_ARN,
+                    'Jenkins Build URL'    : env.BUILD_URL
+                ])
+            }
         }
         unsuccessful {
             echo "API pipeline did not complete successfully. Build: ${env.BUILD_URL}, commit: ${env.GIT_COMMIT_SHA}, image: ${env.IMAGE_URI}"
             script {
+                boolean rollbackNeeded = env.SERVICE_UPDATE_REQUESTED == 'true' && env.DEPLOY_PHASE != 'DEPLOY_SUCCESS'
+                sendSlackNotification(':x: API deployment failed', [
+                    Result                 : 'FAILED',
+                    Job                    : env.JOB_NAME,
+                    Build                  : env.BUILD_NUMBER,
+                    Commit                 : env.GIT_COMMIT_SHA ?: env.GIT_SHORT_SHA,
+                    'Deploy Phase'         : env.DEPLOY_PHASE,
+                    'Service Update State' : env.SERVICE_UPDATE_REQUESTED == 'true' ? 'AFTER_ECS_SERVICE_UPDATE' : 'BEFORE_ECS_SERVICE_UPDATE',
+                    'Image URI'            : env.IMAGE_URI,
+                    'ECS Service'          : env.ECS_SERVICE_NAME,
+                    'Rollback Needed'      : rollbackNeeded,
+                    'Jenkins Build URL'    : env.BUILD_URL
+                ])
+
                 if (env.DEPLOY_PHASE == 'DEPLOY_SUCCESS') {
                     echo "Rollback skipped: API deployment verification already succeeded."
                 } else if (env.SERVICE_UPDATE_REQUESTED != 'true') {
@@ -723,6 +823,21 @@ PY
                     if (rollbackStatus != 0) {
                         echo "API rollback handling did not complete successfully. Exit code: ${rollbackStatus}"
                     }
+                    env.API_ROLLBACK_RESULT = rollbackStatus == 0 ? 'RECOVERY_VERIFIED' :
+                        (rollbackStatus == 2 ? 'EXTERNAL_UPDATE_DETECTED' : 'ROLLBACK_FAILED')
+                    env.API_FINAL_TASK_DEFINITION_ARN = readEcsServiceRevisionSafely(env.ECS_SERVICE_NAME)
+                    sendSlackNotification(':warning: API rollback result', [
+                        'Rollback Needed'      : true,
+                        'Rollback Attempted'   : true,
+                        'Rollback Result'      : env.API_ROLLBACK_RESULT,
+                        'Requested Revision'   : env.NEW_TASK_DEFINITION_ARN,
+                        'Baseline Revision'    : env.PREVIOUS_TASK_DEFINITION_ARN,
+                        'Final Revision'       : env.API_FINAL_TASK_DEFINITION_ARN,
+                        'Baseline Restored'    : env.API_FINAL_TASK_DEFINITION_ARN == env.PREVIOUS_TASK_DEFINITION_ARN,
+                        'ECS Service'          : env.ECS_SERVICE_NAME,
+                        'Deploy Phase'         : env.DEPLOY_PHASE,
+                        'Jenkins Build URL'    : env.BUILD_URL
+                    ])
                 }
             }
         }
