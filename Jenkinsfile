@@ -80,6 +80,8 @@ pipeline {
         disableConcurrentBuilds()
         // Jenkins 저장공간이 계속 증가하지 않도록 최근 빌드 이력 20개만 보관합니다.
         buildDiscarder(logRotator(numToKeepStr: '20'))
+        // Workspace Checkout은 Source Checkout Stage에서 Shallow Clone으로 한 번만 수행합니다.
+        skipDefaultCheckout(true)
         // 명령 또는 AWS 배포가 장시간 멈춰 있으면 전체 Pipeline을 종료합니다.
         timeout(time: 30, unit: 'MINUTES')
     }
@@ -112,7 +114,18 @@ pipeline {
         // Webhook을 발생시킨 커밋을 Checkout하고 빌드마다 고유한 이미지 태그를 생성합니다.
         stage('Source Checkout') {
             steps {
-                checkout scm
+                checkout([
+                    $class: 'GitSCM',
+                    branches: scm.branches,
+                    userRemoteConfigs: scm.userRemoteConfigs,
+                    extensions: [[
+                        $class: 'CloneOption',
+                        shallow: true,
+                        depth: 1,
+                        noTags: true,
+                        timeout: 10
+                    ]]
+                ])
                 script {
                     env.SERVICE_UPDATE_REQUESTED = 'false'
                     env.DEPLOY_PHASE = 'PRE_DEPLOY'
