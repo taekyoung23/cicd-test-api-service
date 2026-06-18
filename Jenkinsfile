@@ -231,20 +231,24 @@ def buildAiFailurePrompt(String serviceName, Map context) {
 아래 정보는 Jenkins Pipeline 실패 이후 수집된 메타데이터와 마스킹된 로그다.
 제공된 정보 안에서만 판단하고, 확정 원인이 아니라 "추정 원인"으로 표현해라.
 민감정보, 계정 ID, ARN, IP, URL, Secret, Token, DB 정보, Queue URL, S3 경로는 출력하지 마라.
-로그가 부족하면 "로그 부족"이라고 말해라.
-Trivy Warning Mode 결과는 현재 배포 차단 사유가 아니므로 실패 원인으로 단정하지 마라.
-Rollback이 성공했는지, 실패했는지, 또는 불필요했는지 구분해라.
-Slack 메시지용으로 7줄 이내로 작성해라.
+Jenkins console log tail이 LOG_COLLECTION_FAILED이면 Slack 요약에 언급하지 마라. 이것은 배포 실패 원인이 아니라 보조 로그 수집 제한이다.
+Trivy Mode가 WARNING이고 Gate가 NOT_APPLIED이면 Trivy findings를 배포 실패 원인이나 Next Action으로 쓰지 마라.
+내부 테스트 관련 파라미터나 테스트 맥락을 암시하는 표현은 출력하지 마라.
+Rollback 결과가 RECOVERY_VERIFIED이면 baseline revision으로 정상 복구된 것으로 표현해라.
+Rollback 결과가 ROLLBACK_FAILED이면 수동 복구 확인이 필요하다고 표현해라.
+Rollback 결과가 ROLLBACK_NOT_REQUIRED이면 rollback이 필요 없는 실패로 표현해라.
+Slack 운영 알림용으로 짧고 실무적으로 작성해라.
 
 출력 형식:
 
-[AI Failure Summary]
-1. 실패 위치:
-2. 추정 원인:
-3. 근거 로그:
-4. 영향 범위:
-5. Rollback 상태:
-6. 다음 조치:
+Likely Cause:
+<1~2문장. 실패 stage 기준의 추정 원인만 작성>
+
+Rollback Status:
+<rollback result와 복구 여부를 1문장으로 작성>
+
+Next Action:
+<운영자가 다음에 확인할 위치만 1~2문장으로 작성>
 
 서비스: ${serviceName}
 입력 데이터:
@@ -263,6 +267,44 @@ def writeAiFailureSummaryArtifact(String serviceType, Map summary) {
         echo "AI failure summary: unable to write ${artifactPath}; ignored."
     }
     return artifactPath
+}
+
+def fallbackLikelyCause(String failedStage) {
+    if ((failedStage ?: '').contains('POST_DEPLOY_VERIFICATION')) {
+        return 'Post-Deploy Verification 단계에서 API 검증 실패가 감지되었습니다.'
+    }
+    if ((failedStage ?: '').contains('SERVICE_STABILIZATION')) {
+        return 'ECS 서비스 안정화 단계에서 배포 실패가 감지되었습니다.'
+    }
+    return 'Jenkins Pipeline 실행 중 배포 실패가 감지되었습니다.'
+}
+
+def fallbackRollbackStatusText(String rollbackStatus) {
+    switch (rollbackStatus ?: 'N/A') {
+        case 'RECOVERY_VERIFIED':
+            return 'RECOVERY_VERIFIED — baseline revision으로 정상 복구되었습니다.'
+        case 'ROLLBACK_FAILED':
+            return 'RECOVERY_FAILED — 수동 복구 확인이 필요합니다.'
+        case 'EXTERNAL_UPDATE_DETECTED':
+            return 'MANUAL_REVIEW_REQUIRED — 외부 업데이트가 감지되어 수동 확인이 필요합니다.'
+        case 'ROLLBACK_NOT_REQUIRED':
+            return 'NOT_REQUIRED'
+        case 'ROLLBACK_NOT_COMPLETED':
+            return 'NOT_COMPLETED — rollback 완료 여부 확인이 필요합니다.'
+        default:
+            return rollbackStatus ?: 'N/A'
+    }
+}
+
+def fallbackNextAction(String rollbackStatus) {
+    switch (rollbackStatus ?: 'N/A') {
+        case 'ROLLBACK_FAILED':
+            return '즉시 ECS Service Events, stopped task reason, ALB Target Health, 현재 task definition revision을 확인하고 baseline revision으로 수동 rollback을 검토하세요.'
+        case 'ROLLBACK_NOT_REQUIRED':
+            return '실패한 Jenkins stage의 build/test/docker/ecr 로그를 확인하세요.'
+        default:
+            return 'ALB Target Health, ECS Task Logs, ECS Service Events, /api/health 응답을 우선 확인하세요.'
+    }
 }
 
 def invokeBedrockFailureSummary(String serviceType, String prompt, Map metadata) {
@@ -334,6 +376,7 @@ response_path, summary_path, error_path, properties_path, status = sys.argv[1], 
 summary_text = ""
 error = ""
 status_name = "SUMMARY_FAILED"
+section_labels = ["Likely Cause", "Rollback Status", "Next Action"]
 
 def read_error():
     try:
@@ -349,6 +392,27 @@ def classify_error(message):
     if "validationexception" in lowered or "validation" in lowered:
         return "BEDROCK_VALIDATION_ERROR"
     return "BEDROCK_INVOKE_FAILED"
+
+def extract_sections(text):
+    sections = {label: "" for label in section_labels}
+    current = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        matched = None
+        for label in section_labels:
+            if line.lower().startswith(label.lower() + ":"):
+                matched = label
+                remainder = line[len(label) + 1:].strip()
+                sections[label] = remainder
+                break
+        if matched:
+            current = matched
+            continue
+        if current and line:
+            if sections[current]:
+                sections[current] += " "
+            sections[current] += line
+    return sections
 
 if status == "0":
     try:
@@ -377,6 +441,7 @@ else:
         error = f"{error}: {stderr_text[:1200]}"
     status_name = classify_error(stderr_text)
 
+sections = extract_sections(summary_text) if summary_text else {label: "" for label in section_labels}
 payload = {
     "enabled": True,
     "provider": "bedrock",
@@ -384,13 +449,16 @@ payload = {
     "status": status_name,
     "invoke_exit_code": status,
     "summary_for_slack": summary_text if summary_text else "AI Failure Summary failed. Check Jenkins console and AWS deployment logs manually.",
+    "likely_cause": sections.get("Likely Cause", ""),
+    "rollback_status_text": sections.get("Rollback Status", ""),
+    "next_action": sections.get("Next Action", ""),
     "error": error,
     "masked": True,
 }
 with open(summary_path, "w", encoding="utf-8") as summary_file:
     json.dump(payload, summary_file, indent=2, ensure_ascii=False)
 with open(properties_path, "w", encoding="utf-8") as properties_file:
-    for key in ["enabled", "provider", "model", "status", "invoke_exit_code", "summary_for_slack", "error", "masked"]:
+    for key in ["enabled", "provider", "model", "status", "invoke_exit_code", "summary_for_slack", "likely_cause", "rollback_status_text", "next_action", "error", "masked"]:
         value = payload.get(key, "")
         value = str(value).replace("\\r", "\\\\r").replace("\\n", "\\\\n")
         properties_file.write(f"{key}={value}\\n")
@@ -405,6 +473,9 @@ PY
         invoke_exit_code : 'N/A',
         error            : "AI summary shell wrapper failed with exit code ${status}",
         summary_for_slack: 'AI Failure Summary failed. Check Jenkins console and AWS deployment logs manually.',
+        likely_cause     : fallbackLikelyCause(metadata.failed_stage ?: 'N/A'),
+        rollback_status_text: fallbackRollbackStatusText(metadata.rollback_status ?: 'N/A'),
+        next_action      : fallbackNextAction(metadata.rollback_status ?: 'N/A'),
         masked           : true
     ]
     try {
@@ -433,11 +504,12 @@ PY
     }
     echo "AI failure summary: shell wrapper exit code=${status}, Bedrock invoke exit code=${parsed.invoke_exit_code ?: 'N/A'}, summary status=${parsed.status ?: 'N/A'}, error=${maskSensitiveText(truncateText(parsed.error ?: 'N/A', 1200))}"
     parsed.failed_stage = metadata.failed_stage ?: 'N/A'
-    parsed.estimated_cause = parsed.summary_for_slack ?: 'N/A'
+    parsed.likely_cause = parsed.likely_cause ?: fallbackLikelyCause(parsed.failed_stage)
     parsed.evidence = metadata.evidence ?: 'N/A'
     parsed.impact = metadata.impact ?: 'N/A'
     parsed.rollback_status = metadata.rollback_status ?: 'N/A'
-    parsed.next_action = parsed.summary_for_slack ?: 'N/A'
+    parsed.rollback_status_text = parsed.rollback_status_text ?: fallbackRollbackStatusText(parsed.rollback_status)
+    parsed.next_action = parsed.next_action ?: fallbackNextAction(parsed.rollback_status)
     parsed.masked = true
     writeAiFailureSummaryArtifact(serviceType, parsed)
     sh(returnStatus: true, script: "rm -f '${promptFile}' '${requestFile}' '${responseFile}' '${runtimeSummaryFile}' '${propertiesFile}' '${errorFile}'")
@@ -451,9 +523,9 @@ def sendAiFailureSummarySlack(String title, Map summary, Map details) {
         Build              : env.BUILD_NUMBER,
         'Failed Stage'     : details.failed_stage ?: 'N/A',
         'AI Summary Status': summary.status ?: 'N/A',
-        'Estimated Cause'  : summary.summary_for_slack ?: summary.estimated_cause ?: 'N/A',
-        Rollback           : details.rollback_status ?: 'N/A',
-        'Next Action'      : summary.next_action ?: 'Jenkins Console, ECS Events, CloudWatch Logs를 확인하세요.',
+        'Likely Cause'     : summary.likely_cause ?: fallbackLikelyCause(details.failed_stage ?: 'N/A'),
+        'Rollback Status'  : summary.rollback_status_text ?: fallbackRollbackStatusText(details.rollback_status ?: 'N/A'),
+        'Next Action'      : summary.next_action ?: fallbackNextAction(details.rollback_status ?: 'N/A'),
         Jenkins            : maskSensitiveText(env.BUILD_URL ?: 'N/A')
     ])
 }
@@ -484,6 +556,8 @@ def generateApiAiFailureSummary() {
             trivy_status                : trivy.status,
             trivy_high_count            : trivy.high_count,
             trivy_critical_count        : trivy.critical_count,
+            trivy_mode                  : 'WARNING',
+            trivy_gate                  : 'NOT_APPLIED',
             jenkins_console_log_tail    : collectConsoleLogTail(),
             ecs_service_events          : diagnostics.service_events,
             alb_target_health           : diagnostics.target_health,
