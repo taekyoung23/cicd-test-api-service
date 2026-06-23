@@ -2,6 +2,10 @@ def slackDisplay(value) {
     return value == null || value.toString().trim() == '' ? 'N/A' : value.toString()
 }
 
+def apiRunbookLink() {
+    return '<https://github.com/taekyoung23/cicd-test-api-service/blob/ktk-cicd/docs/runbooks/api-deployment-runbook.md|운영 가이드>'
+}
+
 def sendSlackNotification(String title, Map details) {
     String messageFile = ".slack-message-${env.BUILD_NUMBER ?: 'unknown'}.txt"
     String payloadFile = ".slack-payload-${env.BUILD_NUMBER ?: 'unknown'}.json"
@@ -526,7 +530,8 @@ def sendAiFailureSummarySlack(String title, Map summary, Map details) {
         'Likely Cause'     : summary.likely_cause ?: fallbackLikelyCause(details.failed_stage ?: 'N/A'),
         'Rollback Status'  : summary.rollback_status_text ?: fallbackRollbackStatusText(details.rollback_status ?: 'N/A'),
         'Next Action'      : summary.next_action ?: fallbackNextAction(details.rollback_status ?: 'N/A'),
-        Jenkins            : maskSensitiveText(env.BUILD_URL ?: 'N/A')
+        Jenkins            : maskSensitiveText(env.BUILD_URL ?: 'N/A'),
+        Runbook            : apiRunbookLink()
     ])
 }
 
@@ -1317,7 +1322,8 @@ PY
                     'Image URI'            : env.IMAGE_URI,
                     'ECS Service'          : env.ECS_SERVICE_NAME,
                     'Rollback Needed'      : rollbackNeeded,
-                    'Jenkins Build URL'    : env.BUILD_URL
+                    'Jenkins Build URL'    : env.BUILD_URL,
+                    Runbook                : apiRunbookLink()
                 ] + trivySlackDetails('api'))
 
                 if (env.DEPLOY_PHASE == 'DEPLOY_SUCCESS') {
@@ -1479,7 +1485,8 @@ PY
                         'Baseline Restored'    : env.API_FINAL_TASK_DEFINITION_ARN == env.PREVIOUS_TASK_DEFINITION_ARN,
                         'ECS Service'          : env.ECS_SERVICE_NAME,
                         'Deploy Phase'         : env.DEPLOY_PHASE,
-                        'Jenkins Build URL'    : env.BUILD_URL
+                        'Jenkins Build URL'    : env.BUILD_URL,
+                        Runbook                : apiRunbookLink()
                     ])
                 }
                 generateApiAiFailureSummary()
