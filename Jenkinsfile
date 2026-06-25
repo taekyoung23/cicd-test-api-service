@@ -920,8 +920,8 @@ PY
             }
         }
 
-        // 배포 전에 설정된 ECS Service와 Task Definition Family가 존재하는지 확인합니다.
-        stage('ECS Deploy Dry Check') {
+        // ECS 배포 사전 확인, 새 Task Definition Revision 등록, Service Update를 순서대로 수행합니다.
+        stage('ECS Task Definition & Service Update') {
             steps {
                 sh '''
                     set -eu
@@ -939,12 +939,7 @@ PY
                       --output text
                     echo "ECS deploy dry check complete for ${ECS_SERVICE_NAME} using ${IMAGE_URI}"
                 '''
-            }
-        }
 
-        // 현재 Task Definition을 복제하고 새 이미지가 반영된 Revision을 등록합니다.
-        stage('ECS Task Definition Revision Register') {
-            steps {
                 script {
                     env.PREVIOUS_TASK_DEFINITION_ARN = sh(
                         script: '''
@@ -1063,12 +1058,7 @@ PY
                     ).trim()
                     echo "Registered new task definition revision: ${env.NEW_TASK_DEFINITION_ARN}"
                 }
-            }
-        }
 
-        // API ECS Service가 새로 등록한 Task Definition Revision을 사용하도록 변경합니다.
-        stage('ECS Service Update') {
-            steps {
                 script {
                     env.DEPLOY_PHASE = 'ECS_SERVICE_UPDATE'
                     // 배포 이력이 불명확해지는 것을 방지하기 위해 Service Update는 한 번만 실행합니다.
