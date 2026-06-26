@@ -182,19 +182,8 @@ Invoke-RestMethod http://api-origin.mzmt.shop/api/health
 - Jenkins Pipeline과의 충돌 여부
 - 담당자 승인 필요 여부
 
-## 17. 최소 캡처 목록
 
-```text
-01-api-before-rollback-current-state.png
-02-api-task-definition-image-check.png
-03-api-rollback-image-exists.png
-04-api-rollback-to-previous-revision.png
-05-api-rollback-health-ok.png
-06-api-restore-to-current-revision.png
-07-api-restore-health-ok.png
-```
-
-## 18. 검증 체크리스트
+## 17. 검증 체크리스트
 
 - [ ] 현재 정상 Revision 기록
 - [ ] 이전 정상 Revision 확정
@@ -207,9 +196,6 @@ Invoke-RestMethod http://api-origin.mzmt.shop/api/health
 - [ ] 복구 후 services-stable 성공
 - [ ] 복구 후 `/api/health` 정상
 
-## 19. 이번 검증 예시
-
-아래 값은 이번 검증 예시이다. 실제 장애 대응 시에는 반드시 현재 Revision과 이전 정상 Revision을 다시 조회해야 한다.
 
 | 구분 | Task Definition Revision | 이미지 태그 |
 |---|---|---|
