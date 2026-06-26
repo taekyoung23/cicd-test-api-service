@@ -2,6 +2,67 @@ def slackDisplay(value) {
     return value == null || value.toString().trim() == '' ? 'N/A' : value.toString()
 }
 
+def slackSection(Map details) {
+    return details.collect { key, value ->
+        "- ${key}: ${slackDisplay(value)}"
+    }.join('\n')
+}
+
+def yesNo(value) {
+    return value == true || value?.toString() == 'true' ? 'Yes' : 'No'
+}
+
+def executedText(value) {
+    return value == true || value?.toString() == 'true' ? '실행됨' : '미실행'
+}
+
+def shortSha(value) {
+    String text = slackDisplay(value)
+    return text == 'N/A' ? text : text.take(7)
+}
+
+def shortImageTag(value) {
+    String text = slackDisplay(value)
+    if (text == 'N/A') {
+        return text
+    }
+    if (text.contains('@')) {
+        return text.substring(text.lastIndexOf('@') + 1).replace('sha256:', 'sha256:').take(19)
+    }
+    int index = text.lastIndexOf(':')
+    return index >= 0 ? text.substring(index + 1) : text
+}
+
+def shortDigest(value) {
+    String text = slackDisplay(value).replace('sha256:', '')
+    return text == 'N/A' ? text : "sha256:${text.take(12)}"
+}
+
+def shortTaskDefinition(value) {
+    String text = slackDisplay(value)
+    if (text == 'N/A') {
+        return text
+    }
+    String marker = 'task-definition/'
+    if (text.contains(marker)) {
+        return text.substring(text.indexOf(marker) + marker.length())
+    }
+    return text.contains('/') ? text.substring(text.lastIndexOf('/') + 1) : text
+}
+
+def apiFailureTitle(String phase) {
+    if ((phase ?: '').contains('STABILIZATION')) {
+        return ':x: API 배포 실패 - ECS 안정화 실패'
+    }
+    if ((phase ?: '').contains('POST_DEPLOY') || (phase ?: '').contains('VERIFY')) {
+        return ':x: API 배포 실패 - 배포 후 검증 실패'
+    }
+    if ((phase ?: '').contains('SERVICE_UPDATE')) {
+        return ':x: API 배포 실패 - ECS Service Update 실패'
+    }
+    return ':x: API 배포 실패 - Pipeline 실패'
+}
+
 def apiRunbookLink() {
     return '<https://github.com/taekyoung23/cicd-test-api-service/blob/ktk-cicd/docs/runbooks/api-deployment-runbook.md|운영 가이드>'
 }
@@ -102,12 +163,13 @@ PY
 def trivySlackDetails(String serviceType) {
     Map trivy = readTrivySummary(serviceType)
     return [
-        'Trivy'          : trivy.status,
-        'Trivy HIGH'     : trivy.high_count,
-        'Trivy CRITICAL' : trivy.critical_count,
-        'Trivy Mode'     : 'WARNING',
-        'Trivy Gate'     : 'NOT_APPLIED',
-        'Trivy Report'   : 'Jenkins Artifact 확인'
+        '보안 스캔' : slackSection([
+            Trivy     : 'WARNING',
+            Status    : trivy.status,
+            Findings  : "HIGH ${trivy.high_count} / CRITICAL ${trivy.critical_count}",
+            '배포 차단': 'No',
+            Report    : 'Jenkins Artifact 확인'
+        ])
     ]
 }
 
@@ -522,16 +584,18 @@ PY
 
 def sendAiFailureSummarySlack(String title, Map summary, Map details) {
     sendSlackNotification(title, [
-        Service            : details.service ?: 'N/A',
-        Job                : env.JOB_NAME,
-        Build              : env.BUILD_NUMBER,
-        'Failed Stage'     : details.failed_stage ?: 'N/A',
-        'AI Summary Status': summary.status ?: 'N/A',
-        'Likely Cause'     : summary.likely_cause ?: fallbackLikelyCause(details.failed_stage ?: 'N/A'),
-        'Rollback Status'  : summary.rollback_status_text ?: fallbackRollbackStatusText(details.rollback_status ?: 'N/A'),
-        'Next Action'      : summary.next_action ?: fallbackNextAction(details.rollback_status ?: 'N/A'),
-        Jenkins            : maskSensitiveText(env.BUILD_URL ?: 'N/A'),
-        Runbook            : apiRunbookLink()
+        '대상' : slackSection([
+            Service       : details.service ?: 'N/A',
+            'Failed stage': details.failed_stage ?: 'N/A',
+            Status        : summary.status ?: 'N/A'
+        ]),
+        '요약' : summary.likely_cause ?: fallbackLikelyCause(details.failed_stage ?: 'N/A'),
+        '복구 상태' : summary.rollback_status_text ?: fallbackRollbackStatusText(details.rollback_status ?: 'N/A'),
+        '다음 확인' : summary.next_action ?: fallbackNextAction(details.rollback_status ?: 'N/A'),
+        '링크' : slackSection([
+            Jenkins: maskSensitiveText(env.BUILD_URL ?: 'N/A'),
+            Runbook: apiRunbookLink()
+        ])
     ])
 }
 
@@ -1285,16 +1349,22 @@ PY
             echo "API image build completed: ${env.IMAGE_URI}"
             echo "Deployment result: DEPLOY_SUCCESS"
             script {
-                sendSlackNotification(':white_check_mark: API deployment succeeded', [
-                    Result                 : 'SUCCESS',
-                    Job                    : env.JOB_NAME,
-                    Build                  : env.BUILD_NUMBER,
-                    Commit                 : env.GIT_COMMIT_SHA ?: env.GIT_SHORT_SHA,
-                    'Image URI'            : env.IMAGE_URI,
-                    'Image Digest'         : env.IMAGE_DIGEST,
-                    'ECS Service'          : env.ECS_SERVICE_NAME,
-                    'New Task Definition'  : env.NEW_TASK_DEFINITION_ARN,
-                    'Jenkins Build URL'    : env.BUILD_URL
+                sendSlackNotification(':white_check_mark: API 배포 성공', [
+                    '핵심 상태' : slackSection([
+                        Build : "#${env.BUILD_NUMBER}",
+                        Result: 'SUCCESS',
+                        Phase : env.DEPLOY_PHASE ?: 'DEPLOY_SUCCESS'
+                    ]),
+                    '배포 정보' : slackSection([
+                        Service : env.ECS_SERVICE_NAME,
+                        Image   : shortImageTag(env.IMAGE_URI),
+                        Digest  : shortDigest(env.IMAGE_DIGEST),
+                        Commit  : shortSha(env.GIT_COMMIT_SHA ?: env.GIT_SHORT_SHA),
+                        Revision: shortTaskDefinition(env.NEW_TASK_DEFINITION_ARN)
+                    ]),
+                    '링크' : slackSection([
+                        Jenkins: env.BUILD_URL
+                    ])
                 ] + trivySlackDetails('api'))
             }
         }
@@ -1302,18 +1372,22 @@ PY
             echo "API pipeline did not complete successfully. Build: ${env.BUILD_URL}, commit: ${env.GIT_COMMIT_SHA}, image: ${env.IMAGE_URI}"
             script {
                 boolean rollbackNeeded = env.SERVICE_UPDATE_REQUESTED == 'true' && env.DEPLOY_PHASE != 'DEPLOY_SUCCESS'
-                sendSlackNotification(':x: API deployment failed', [
-                    Result                 : 'FAILED',
-                    Job                    : env.JOB_NAME,
-                    Build                  : env.BUILD_NUMBER,
-                    Commit                 : env.GIT_COMMIT_SHA ?: env.GIT_SHORT_SHA,
-                    'Deploy Phase'         : env.DEPLOY_PHASE,
-                    'Service Update State' : env.SERVICE_UPDATE_REQUESTED == 'true' ? 'AFTER_ECS_SERVICE_UPDATE' : 'BEFORE_ECS_SERVICE_UPDATE',
-                    'Image URI'            : env.IMAGE_URI,
-                    'ECS Service'          : env.ECS_SERVICE_NAME,
-                    'Rollback Needed'      : rollbackNeeded,
-                    'Jenkins Build URL'    : env.BUILD_URL,
-                    Runbook                : apiRunbookLink()
+                sendSlackNotification(apiFailureTitle(env.DEPLOY_PHASE), [
+                    '핵심 상태' : slackSection([
+                        Build        : "#${env.BUILD_NUMBER}",
+                        '실패 단계'   : env.DEPLOY_PHASE,
+                        'ECS Update' : executedText(env.SERVICE_UPDATE_REQUESTED),
+                        'Rollback 필요': yesNo(rollbackNeeded)
+                    ]),
+                    '배포 정보' : slackSection([
+                        Service: env.ECS_SERVICE_NAME,
+                        Image  : shortImageTag(env.IMAGE_URI),
+                        Commit : shortSha(env.GIT_COMMIT_SHA ?: env.GIT_SHORT_SHA)
+                    ]),
+                    '링크' : slackSection([
+                        Jenkins: env.BUILD_URL,
+                        Runbook: apiRunbookLink()
+                    ])
                 ] + trivySlackDetails('api'))
 
                 if (env.DEPLOY_PHASE == 'DEPLOY_SUCCESS') {
@@ -1465,18 +1539,26 @@ PY
                     env.API_ROLLBACK_RESULT = rollbackStatus == 0 ? 'RECOVERY_VERIFIED' :
                         (rollbackStatus == 2 ? 'EXTERNAL_UPDATE_DETECTED' : 'ROLLBACK_FAILED')
                     env.API_FINAL_TASK_DEFINITION_ARN = readEcsServiceRevisionSafely(env.ECS_SERVICE_NAME)
-                    sendSlackNotification(':warning: API rollback result', [
-                        'Rollback Needed'      : true,
-                        'Rollback Attempted'   : true,
-                        'Rollback Result'      : env.API_ROLLBACK_RESULT,
-                        'Requested Revision'   : env.NEW_TASK_DEFINITION_ARN,
-                        'Baseline Revision'    : env.PREVIOUS_TASK_DEFINITION_ARN,
-                        'Final Revision'       : env.API_FINAL_TASK_DEFINITION_ARN,
-                        'Baseline Restored'    : env.API_FINAL_TASK_DEFINITION_ARN == env.PREVIOUS_TASK_DEFINITION_ARN,
-                        'ECS Service'          : env.ECS_SERVICE_NAME,
-                        'Deploy Phase'         : env.DEPLOY_PHASE,
-                        'Jenkins Build URL'    : env.BUILD_URL,
-                        Runbook                : apiRunbookLink()
+                    sendSlackNotification(':warning: API Rollback 결과 - baseline 복구 확인', [
+                        '복구 결과' : slackSection([
+                            Result             : env.API_ROLLBACK_RESULT,
+                            'Baseline restored': yesNo(env.API_FINAL_TASK_DEFINITION_ARN == env.PREVIOUS_TASK_DEFINITION_ARN),
+                            Service            : env.ECS_SERVICE_NAME,
+                            Phase              : env.DEPLOY_PHASE
+                        ]),
+                        'Revision' : slackSection([
+                            Requested: shortTaskDefinition(env.NEW_TASK_DEFINITION_ARN),
+                            Baseline : shortTaskDefinition(env.PREVIOUS_TASK_DEFINITION_ARN),
+                            Final    : shortTaskDefinition(env.API_FINAL_TASK_DEFINITION_ARN)
+                        ]),
+                        '검증' : slackSection([
+                            'ECS stable': env.API_ROLLBACK_RESULT == 'RECOVERY_VERIFIED' ? 'OK' : '확인 필요',
+                            'API health': env.API_ROLLBACK_RESULT == 'RECOVERY_VERIFIED' ? 'OK' : '확인 필요'
+                        ]),
+                        '링크' : slackSection([
+                            Jenkins: env.BUILD_URL,
+                            Runbook: apiRunbookLink()
+                        ])
                     ])
                 }
                 generateApiAiFailureSummary()
