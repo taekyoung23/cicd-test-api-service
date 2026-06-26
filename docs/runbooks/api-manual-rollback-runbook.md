@@ -216,10 +216,3 @@ Invoke-RestMethod http://api-origin.mzmt.shop/api/health
 | 현재 정상 Revision | `securevoice-dev-api:15` | `build-10-7e90b95` |
 | 롤백 대상 Revision | `securevoice-dev-api:14` | `build-9-3331f49` |
 
-## 20. 발표용 요약 문장
-
-API 수동 rollback은 ECS Service의 Task Definition을 이전 정상 Revision으로 변경하고, service stable 대기 후 `/api/health`로 복구를 검증하는 절차이다. 검증 완료 후에는 다시 최신 정상 Revision으로 복구해 현재 운영 상태를 유지한다.
-
-## 21. 한 줄 결론
-
-API 수동 rollback은 특정 revision 번호를 고정하지 않고, 장애 시점의 현재 정상 Revision과 이전 정상 Revision을 조회한 뒤 ECS Service를 명시적으로 전환하고 health check로 검증하는 절차이다.
