@@ -2,30 +2,28 @@
 
 ## 1. 문서 개요
 
-이 문서는 `api-service-cicd` Jenkins Pipeline 실패 시 운영자가 API 배포 장애 원인을 빠르게 분리하고 복구하기 위한 운영 Runbook이다.
-
-적용 범위:
+이 문서는 API 배포 실패 또는 API 장애 발생 시 원인을 판단하기 위한 장애 판단용 Runbook이다.
 
 - 대상 Jenkins Job: `api-service-cicd`
-- 대상 서비스: FastAPI 기반 API Service
-- 배포 대상: ECS Fargate API Service
+- 대상 ECS Service: `securevoice-dev-api-service`
+- 대상 Health Check URL: `http://api-origin.mzmt.shop/api/health`
 - 주요 점검 대상: Jenkins, ECR Image/Digest, ECS API Service, ECS Task Definition Revision, ALB Target Group, `/api/health`, CloudWatch Logs, Deployment Summary Artifact, Slack 알림
-- Health Check URL: `/api/health`
 
-이 Runbook이 다루는 장애 범위:
+다루는 범위:
 
-- Jenkins 실행 및 GitHub Webhook 장애
-- Python build/test 실패
-- Docker image build 및 smoke test 실패
-- Trivy scan 결과 확인
-- ECR login/push 실패
-- ECS Task Definition revision 등록 실패
-- ECS Service update/stable wait 실패
-- ALB Target Health 및 `/api/health` 실패
-- rollback 실패
-- Slack 알림 및 Deployment Summary artifact 누락
+- Jenkins 실패 stage 확인
+- Python Build/Test 실패 확인
+- Docker Build/Smoke Test 실패 확인
+- Trivy Warning Mode 확인
+- ECR Push 실패 확인
+- ECS Service Update 실패 확인
+- ECS Stable Wait 실패 확인
+- ALB Target Health 확인
+- `/api/health` 확인
+- CloudWatch Logs 확인
+- Rollback 필요 여부 판단
 
-이 Runbook이 다루지 않는 범위:
+다루지 않는 범위:
 
 - Worker SQS polling 장애
 - DLQ 유입 장애
@@ -34,30 +32,9 @@
 - Terraform apply 장애
 - CloudFront/S3 frontend 장애
 
-API는 SQS 메시지를 발행할 수 있지만, Queue 적체, DLQ, Worker inference 처리는 Worker Runbook에서 다룬다.
+API는 SQS 메시지를 발행할 수 있지만, Queue 적체/DLQ/Worker inference 처리는 Worker Runbook에서 다룬다.
 
 ## 2. API 배포 아키텍처 및 배포 흐름
-
-배포 흐름:
-
-```text
-GitHub push
-→ Jenkins API Pipeline
-→ Source Checkout
-→ Python Build & Test
-→ Docker Image Build
-→ Docker Image Smoke Test
-→ Trivy Image Scan - Warning Mode
-→ ECR Push
-→ ECS Task Definition Revision Register
-→ ECS Service Update
-→ ECS Stable Wait
-→ Post-Deploy Verification
-→ Rollback if needed
-→ Slack Notification
-```
-
-운영 관점의 흐름:
 
 ```text
 GitHub
@@ -79,11 +56,9 @@ API Service의 역할:
 - Free/Paid SQS 메시지 발행
 - `request_id` 기반 결과 조회
 
-Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와 Worker 처리 장애는 분리해서 판단한다.
+Worker inference 자체는 API Runbook 범위가 아니다.
 
 ## 3. 정상 배포 기준
-
-아래 조건을 모두 만족하면 API 배포가 정상 완료된 것으로 판단한다.
 
 - Jenkins build result가 `SUCCESS`
 - Python build/test 통과
@@ -93,9 +68,9 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 - Image digest 확인
 - ECS Task Definition Revision 생성
 - ECS Service Update 요청 성공
-- ECS service stable 상태 도달
+- ECS service stable
 - Running Task가 새 revision 사용
-- ALB Target Group에 healthy target 존재
+- ALB Target Group healthy target 존재
 - `/api/health` HTTP 200 응답
 - Deployment Summary Artifact 생성
 - Slack 성공 알림 수신
@@ -126,12 +101,12 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 
 - executor 부족이면 대기 후 재시도
 - Jenkins 자체 장애면 Jenkins 운영 담당자에게 에스컬레이션
-- 애플리케이션 코드를 임의 수정하거나 Terraform apply로 해결하지 않는다.
+- 애플리케이션 코드나 Terraform을 임의 변경하지 않음
 
 #### 재시도 기준
 
-- Jenkins UI 및 executor가 정상
-- `api-service-cicd`에서 수동 실행 가능
+- Jenkins UI 및 executor 정상
+- `api-service-cicd` 수동 실행 가능
 
 ### 4.2 GitHub Webhook이 Jenkins를 트리거하지 못함
 
@@ -143,14 +118,15 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 #### 주요 원인
 
 - GitHub Webhook 비활성화
-- Payload URL 또는 Secret mismatch
+- Payload URL 오류
+- Webhook shared secret mismatch
 - Jenkins `/github-webhook/` endpoint 접근 실패
 
 #### 확인 방법
 
 - GitHub Recent Deliveries에서 `ping`/`push` 이벤트 200 확인
-- Jenkins Job trigger 설정 확인
 - Jenkins build cause 확인
+- Jenkins Job trigger 설정 확인
 
 #### 조치 방법
 
@@ -161,7 +137,7 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 #### 재시도 기준
 
 - Recent Deliveries 200
-- 작은 commit push로 자동 build 시작
+- 작은 commit push 후 자동 build 시작
 
 ### 4.3 Source Checkout 실패
 
@@ -221,7 +197,7 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 #### 재시도 기준
 
 - requirements 설치 성공
-- import와 pytest가 모두 통과
+- import와 pytest 모두 통과
 
 ### 4.5 Docker Image Build 실패
 
@@ -253,7 +229,7 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 
 #### 재시도 기준
 
-- BuildKit build가 성공하고 이미지 tag가 생성됨
+- BuildKit build 성공 및 image tag 생성
 
 ### 4.6 Docker Image Smoke Test 실패
 
@@ -275,16 +251,16 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 - smoke test container 로그 확인
 - 컨테이너가 포트 8000에서 기동되는지 확인
 - `/api/health` 로컬 응답 확인
-- cleanup 여부 확인
+- smoke test container cleanup 여부 확인
 
 #### 조치 방법
 
 - app startup 오류 수정
-- Dockerfile/entrypoint/환경변수 의존성 수정
+- Dockerfile/entrypoint/환경 변수 의존성 수정
 
 #### 재시도 기준
 
-- smoke container가 정상 기동되고 `/api/health`가 응답
+- smoke container 정상 기동 및 `/api/health` 응답
 
 ### 4.7 Trivy Scan 실패 또는 finding 존재
 
@@ -301,19 +277,19 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 
 #### 확인 방법
 
-- Trivy artifact와 summary 확인
-- `Trivy Mode=WARNING` 확인
-- `Trivy Gate=NOT_APPLIED` 확인
+- Trivy summary/artifact 확인
+- `Trivy Mode=WARNING`
+- `Trivy Gate=NOT_APPLIED`
 
 #### 조치 방법
 
 - Trivy 실행 실패면 네트워크/도구 상태 확인 후 재시도
 - finding은 별도 보안 조치 항목으로 등록
-- 현재는 finding 자체를 배포 차단 또는 rollback 원인으로 판단하지 않음
+- 현재 finding 자체는 배포 차단 또는 rollback 원인이 아님
 
 #### 재시도 기준
 
-- Trivy scan이 완료되고 summary/artifact가 생성됨
+- Trivy scan 완료 및 summary/artifact 생성
 
 ### 4.8 ECR Login/Push 실패
 
@@ -328,7 +304,7 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 - Jenkins Role 권한 부족
 - ECR repository 이름 오류
 - AWS CLI 인증 문제
-- 네트워크 또는 ECR 일시 장애
+- ECR 일시 장애
 
 #### 확인 방법
 
@@ -341,7 +317,7 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 
 - ECR repository와 region 확인
 - 권한 문제는 Jenkins Role policy 확인
-- push 실패 시 재시도 전 같은 tag 충돌 여부 확인
+- tag 충돌 또는 네트워크 장애 여부 확인
 
 #### 재시도 기준
 
@@ -353,7 +329,7 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 #### 증상
 
 - 새 task definition revision 등록 실패
-- JSON 생성 또는 AWS CLI 오류 발생
+- task-definition JSON 생성 또는 AWS CLI 오류 발생
 
 #### 주요 원인
 
@@ -384,7 +360,7 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 #### 증상
 
 - `aws ecs update-service` 실패
-- service update 요청 후 즉시 오류
+- service update 요청 직후 오류
 
 #### 주요 원인
 
@@ -402,7 +378,7 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 
 #### 조치 방법
 
-- 잘못된 ARN/name 수정
+- ARN/name 오류 수정
 - 권한 문제 확인
 - Service Update 전 실패라면 rollback 불필요
 
@@ -415,7 +391,7 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 #### 증상
 
 - `aws ecs wait services-stable` timeout 또는 실패
-- task가 반복 stop/restart
+- task 반복 stop/restart
 
 #### 주요 원인
 
@@ -436,12 +412,12 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 
 - ECS가 baseline으로 rollback했는지 확인
 - Jenkins rollback result 확인
-- task stopped reason과 로그 기반 원인 분석
+- stopped reason과 로그 기반 원인 분석
 
 #### 재시도 기준
 
-- ECS service stable 상태
-- final revision이 기대 revision 또는 baseline으로 명확히 정리됨
+- ECS service stable
+- final revision이 expected revision 또는 baseline으로 명확히 정리됨
 
 ### 4.12 ALB Target Health 실패
 
@@ -466,7 +442,7 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 #### 조치 방법
 
 - unhealthy reason 기준으로 포트, path, app log 확인
-- Jenkins rollback 이후 healthy target 복구 여부 확인
+- rollback 이후 healthy target 복구 여부 확인
 
 #### 재시도 기준
 
@@ -490,7 +466,7 @@ Worker inference 자체는 API Runbook 범위가 아니다. API 배포 장애와
 #### 확인 방법
 
 ```bash
-curl -i https://<api-domain>/api/health
+curl -i http://api-origin.mzmt.shop/api/health
 ```
 
 - Jenkins Console Log의 Post-Deploy Verification 확인
@@ -529,13 +505,13 @@ curl -i https://<api-domain>/api/health
 
 #### 조치 방법
 
-- 마지막 정상 task definition revision으로 ECS Service 수동 업데이트
+- 마지막 정상 revision으로 수동 복구가 필요하면 `API 수동 Rollback Runbook`으로 이동
 - 외부 변경 여부 확인
 - 실패 revision 원인 분석 기록
 
 #### 재시도 기준
 
-- final revision이 baseline으로 복구
+- final revision이 baseline 또는 의도한 정상 revision으로 복구
 - ALB Target Health와 `/api/health` 정상
 
 ### 4.15 Slack Notification 실패
@@ -555,7 +531,7 @@ curl -i https://<api-domain>/api/health
 
 - Jenkins Console Log 확인
 - credential ID 존재 여부 확인
-- Slack webhook URL 값은 출력하지 않음
+- Slack Webhook URL 값은 출력하지 않음
 
 #### 조치 방법
 
@@ -564,7 +540,7 @@ curl -i https://<api-domain>/api/health
 
 #### 재시도 기준
 
-- Slack 알림이 정상 수신됨
+- Slack 알림 정상 수신
 
 ### 4.16 Deployment Summary Artifact 누락
 
@@ -591,25 +567,21 @@ curl -i https://<api-domain>/api/health
 
 #### 재시도 기준
 
-- Deployment Summary Artifact가 생성되고 archive됨
+- Deployment Summary Artifact 생성 및 archive 완료
 
 ## 5. API Stage별 상세 장애 대응
 
 ### Python Build & Test
 
-확인 항목:
-
 - requirements 설치 실패 여부
 - import 실패 여부
 - pytest 실패 여부
 - 환경 변수 의존성 문제
-- 테스트 실패가 배포 차단 사유인지
+- 테스트 실패가 배포 차단 사유인지 확인
 
-테스트 실패는 배포 차단 사유로 본다. 운영자가 임의로 skip하지 않는다.
+테스트 실패는 배포 차단 사유로 본다.
 
 ### Docker Image Build
-
-확인 항목:
 
 - Dockerfile 경로
 - BuildKit 사용 여부
@@ -622,8 +594,6 @@ Docker socket 사용은 운영 리스크가 있으므로 후속 고도화 항목
 
 ### Docker Image Smoke Test
 
-확인 항목:
-
 - 컨테이너 실행 여부
 - `/api/health` 로컬 smoke test 응답
 - 포트 8000
@@ -632,16 +602,13 @@ Docker socket 사용은 운영 리스크가 있으므로 후속 고도화 항목
 
 ### Trivy Image Scan
 
-현재 Trivy는 `WARNING` 모드이다.
-
+- 현재 Trivy는 `WARNING` 모드이다.
 - `HIGH/CRITICAL` finding이 있어도 현재는 배포 차단 Gate가 아니다.
 - `Trivy Gate=NOT_APPLIED`
 - finding은 별도 보안 조치 항목으로 관리한다.
 - 발표/보고서에서는 “취약점 스캔은 수행하지만 차단 정책은 후속 고도화”라고 설명한다.
 
 ### ECR Push
-
-확인 항목:
 
 - ECR login 성공
 - repository name
@@ -653,8 +620,6 @@ Docker socket 사용은 운영 리스크가 있으므로 후속 고도화 항목
 
 ### ECS Deploy
 
-확인 항목:
-
 - 기존 Task Definition 조회
 - 새 image URI로 revision 생성
 - 기존 환경 변수/role/log 설정 유지 여부
@@ -664,17 +629,13 @@ Docker socket 사용은 운영 리스크가 있으므로 후속 고도화 항목
 
 ### Post-Deploy Verification
 
-확인 항목:
-
 - ECS Running Task revision
 - ALB Target Health
 - `/api/health`
 - CloudWatch Logs
 - ECS Service Events
 
-### Rollback
-
-확인 항목:
+### Rollback 필요 여부 판단
 
 - Baseline Revision
 - Failed Revision
@@ -684,7 +645,11 @@ Docker socket 사용은 운영 리스크가 있으므로 후속 고도화 항목
 - `/api/health` 복구 여부
 - ALB Target Health 복구 여부
 
-## 6. API 수동 복구 절차
+수동 복구가 필요한 경우 아래 절차형 Runbook을 따른다.
+
+- API 수동 Rollback Runbook: `docs/runbooks/api-manual-rollback-runbook.md`
+
+## 6. API 수동 복구 판단 절차
 
 1. Slack 실패 알림에서 Jenkins Build URL 확인
 2. Failed Stage 확인
@@ -695,8 +660,7 @@ Docker socket 사용은 운영 리스크가 있으므로 후속 고도화 항목
 7. `/api/health` 확인
 8. CloudWatch Logs 확인
 9. Rollback Result 확인
-10. 필요 시 마지막 정상 Task Definition Revision으로 ECS Service 수동 업데이트
-11. 재배포 또는 revert commit 기준으로 복구
+10. Jenkins 자동 rollback으로 복구되지 않은 경우 `API 수동 Rollback Runbook`으로 이동
 
 주의:
 
@@ -704,7 +668,7 @@ Docker socket 사용은 운영 리스크가 있으므로 후속 고도화 항목
 - DB schema를 임의 변경하지 않는다.
 - Worker/SQS/DLQ 장애를 API 배포 실패로 오인하지 않는다.
 
-## 7. API Rollback 기준
+## 7. API Rollback 판단 기준
 
 자동 rollback이 시도될 수 있는 조건:
 
@@ -725,14 +689,6 @@ rollback이 필요 없는 조건:
 - ALB Target Health 복구 확인
 - `/api/health` 복구 확인
 - Running Task revision 확인
-
-rollback 실패 시:
-
-1. 마지막 정상 Task Definition Revision 확인
-2. ECS Service를 해당 revision으로 수동 update
-3. service stable 대기
-4. ALB Target Health와 `/api/health` 재확인
-5. 실패 revision 원인 분석
 
 ## 8. API 보안 및 운영 주의사항
 
