@@ -700,7 +700,3 @@ rollback이 필요 없는 조건:
 - Docker socket mount 리스크는 후속 고도화 항목이다.
 - API desired count가 1인 환경에서는 완전 무중단 배포라고 표현하지 않는다.
 - 발표/보고서에서는 “중단 위험을 줄이는 rolling deployment와 rollback 구조”로 표현한다.
-
-## 9. API 보고서/발표용 요약
-
-API CI/CD는 Docker image build, ECR push, ECS Task Definition revision 배포, ALB Target Health, `/api/health` 검증을 중심으로 구성했다. 배포 실패 시 Jenkins는 baseline revision을 기준으로 rollback을 수행하고, rollback 후 ALB와 API health를 다시 확인한다. Trivy는 Warning Mode로 실행해 보안 스캔 증적을 확보하되, 현재는 배포 차단 Gate로 적용하지 않는다. 또한 API 장애와 Worker/SQS/DLQ 장애를 분리해 운영 점검하도록 Runbook을 구성했다.
