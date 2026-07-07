@@ -64,7 +64,7 @@ def apiFailureTitle(String phase) {
 }
 
 def apiRunbookLink() {
-    return '<https://github.com/taekyoung23/cicd-test-api-service/blob/ktk-cicd/docs/runbooks/api-deployment-runbook.md|운영 가이드>'
+    return '<https://github.com/taekyoung23/cicd-test-api-service/blob/ktk-cicd/docs/runbooks/api-deployment-operations-runbook.md|운영 가이드>'
 }
 
 def sendSlackNotification(String title, Map details) {

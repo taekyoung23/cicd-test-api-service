@@ -505,7 +505,7 @@ curl -i http://api-origin.mzmt.shop/api/health
 
 #### 조치 방법
 
-- 마지막 정상 revision으로 수동 복구가 필요하면 `API 수동 Rollback Runbook`으로 이동
+- 마지막 정상 revision으로 수동 복구가 필요하면 [API 수동 Rollback Runbook](./api-manual-rollback-runbook.md)으로 이동
 - 외부 변경 여부 확인
 - 실패 revision 원인 분석 기록
 
@@ -647,7 +647,7 @@ Docker socket 사용은 운영 리스크가 있으므로 후속 고도화 항목
 
 수동 복구가 필요한 경우 아래 절차형 Runbook을 따른다.
 
-- API 수동 Rollback Runbook: `docs/runbooks/api-manual-rollback-runbook.md`
+- [API 수동 Rollback Runbook](./api-manual-rollback-runbook.md)
 
 ## 6. API 수동 복구 판단 절차
 
@@ -660,7 +660,7 @@ Docker socket 사용은 운영 리스크가 있으므로 후속 고도화 항목
 7. `/api/health` 확인
 8. CloudWatch Logs 확인
 9. Rollback Result 확인
-10. Jenkins 자동 rollback으로 복구되지 않은 경우 `API 수동 Rollback Runbook`으로 이동
+10. Jenkins 자동 rollback으로 복구되지 않은 경우 [API 수동 Rollback Runbook](./api-manual-rollback-runbook.md)으로 이동
 
 주의:
 
